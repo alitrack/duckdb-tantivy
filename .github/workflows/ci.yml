@@ -1,40 +1,154 @@
-name: CI
+name: Main Extension Distribution Pipeline
 
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md']
+    tags: ['v*']
   pull_request:
-    paths-ignore: ['**.md']
+  workflow_dispatch:
 
-# Each platform builds natively on a matching-arch runner (no cross-compile),
-# then the in-repo append_metadata bin stamps the 512-byte DuckDB footer and we
-# run the full test suite (which compiles a bundled in-memory DuckDB to LOAD it).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux_amd64
-          - os: macos-latest
-            platform: osx_arm64
-    runs-on: ${{ matrix.os }}
+# ── Smoke tests ─────────────────────────────────────────────────────────
+  linux-amd64-smoke:
+    name: Linux amd64 smoke
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build + stamp
-        run: make release DUCKDB_PLATFORM=${{ matrix.platform }}
-
-      - name: Test
-        run: make test
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
         with:
-          name: tantivy-${{ matrix.platform }}
-          path: tantivy.duckdb_extension
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq make ninja-build jq cmake g++
+      - name: Configure
+        run: make configure
+      - name: Build
+        run: make release
+      - name: Test (cargo unit + SQL-level e2e)
+        run: make test
+      - name: Verify
+        run: |
+          ls -la build/release/tantivy.duckdb_extension
+          file build/release/tantivy.duckdb_extension
+
+  macos-arm64-smoke:
+    name: macOS arm64 smoke
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build tools
+        run: brew install ninja
+      - name: Configure
+        run: make configure
+      - name: Build
+        run: make release
+      - name: Test (cargo unit + SQL-level e2e)
+        run: make test
+      - name: Verify
+        run: |
+          ls -la build/release/tantivy.duckdb_extension
+          file build/release/tantivy.duckdb_extension
+
+  windows-amd64-smoke:
+    name: Windows amd64 smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build tools
+        shell: bash
+        run: choco install make ninja jq -y
+      - name: Configure
+        shell: bash
+        run: make configure
+      - name: Build
+        shell: bash
+        env:
+          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+        run: make release
+      # No `make test` on Windows: the cargo e2e suite compiles a bundled
+        # in-memory DuckDB from source (needs the full C++ toolchain); the
+        # distribution job below covers this platform.
+      - name: Verify
+        shell: bash
+        run: ls -la build/release/tantivy.duckdb_extension
+
+# ── Formal distribution (main/tag push) ────────────────────────────────
+  duckdb-stable-build:
+    name: Distribution
+    needs: [linux-amd64-smoke, macos-arm64-smoke, windows-amd64-smoke]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.5
+      ci_tools_version: v1.5-variegata
+      extension_name: tantivy
+      extra_toolchains: rust
+      exclude_archs: 'linux_arm64;wasm_mvp;wasm_eh;wasm_threads'
+      skip_tests: true
+    secrets: inherit
+
+  release:
+    name: Create GitHub Release
+    needs: duckdb-stable-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Rename release assets with platform suffix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+          for artifact_dir in artifacts/*; do
+            [ -d "$artifact_dir" ] || continue
+            artifact_name=$(basename "$artifact_dir")
+            platform_suffix="${artifact_name##*-extension-}"
+            for asset in "$artifact_dir"/*.duckdb_extension "$artifact_dir"/*.duckdb_extension.wasm; do
+              [ -f "$asset" ] || continue
+              asset_name=$(basename "$asset")
+              if [[ "$asset_name" == *.duckdb_extension.wasm ]]; then
+                extension_suffix=".duckdb_extension.wasm"
+                stem="${asset_name%.duckdb_extension.wasm}"
+              else
+                extension_suffix=".duckdb_extension"
+                stem="${asset_name%.duckdb_extension}"
+              fi
+              cp "$asset" "release-assets/${stem}-${platform_suffix}${extension_suffix}"
+            done
+          done
+          test -n "$(find release-assets -type f | head -1)"
+          find release-assets -type f | sort
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

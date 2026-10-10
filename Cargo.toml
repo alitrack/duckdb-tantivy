@@ -7,7 +7,7 @@ license = "MIT"
 description = "DuckDB loadable extension: BM25 full-text search, tokenization, and Snowball stemming powered by tantivy (quack-rs binding layer, no VGI, no Arrow IPC)"
 
 [lib]
-name = "tantivy_ext"
+name = "tantivy"
 crate-type = ["cdylib"]
 
 # Packaging tool (copied from quack-rs, std-only): stamps the 534-byte DuckDB

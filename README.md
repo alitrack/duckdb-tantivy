@@ -63,34 +63,37 @@ SELECT bm25_score('the cat sat','cat');      -- 0.28...
   mutations or filters. Pass a real `id_column` when you need stable ids.
 - `id_column` must be castable to `BIGINT`; non-integer id columns are not
   supported.
-- The in-repo CI/release workflows build for `linux_amd64`, `osx_arm64`, and
-  `osx_amd64`. Artifacts are **unsigned** (load with `duckdb -unsigned`);
-  code-signing and community-registry publication are not set up yet.
+- The in-repo CI/release workflows build for `linux_amd64`, `osx_arm64`,
+  `osx_amd64`, and `windows_amd64` (one native build per platform runner).
+  Artifacts are **unsigned** (load with `duckdb -unsigned`); code-signing and
+  community-registry publication are not set up yet.
 
 ## Building
 
-The build and the DuckDB metadata-footer stamp are driven by `make` (no Python
-venv needed — the stamper is the in-repo `append_metadata` binary):
+The build delegates to [extension-ci-tools](https://github.com/duckdb/extension-ci-tools)
+(vendored as the `extension-ci-tools` submodule), the same pipeline the other
+DuckDB extensions use:
 
 ```sh
-make              # == make release: build the cdylib + stamp the footer
-make test         # cargo test --release (compiles a bundled in-memory DuckDB to LOAD the extension)
-make clean        # cargo clean
-make clean_all    # clean + remove stamped .duckdb_extension artifacts
+git submodule update --init --recursive   # first time only
+make                # == make configure && make release
+make test           # cargo unit tests + SQL-level e2e (LOADs the stamped extension)
+make clean          # clean build/ + cargo clean
+make clean_all      # clean + drop the configure venv
 ```
 
-`make release` produces `tantivy.duckdb_extension` (C_STRUCT, C-API floor
-`v1.2.0`, platform auto-detected from the host). The extension version is read
-from `Cargo.toml`. To force a target, override the variables:
+`make release` builds the cdylib with cargo and appends the 512-byte DuckDB
+metadata footer, producing `build/release/tantivy.duckdb_extension`
+(C_STRUCT, C-API floor `v1.2.0`, platform auto-detected by `make configure`).
+`make test` mirrors it to `target/release/` and runs the cargo suite, which
+compiles a bundled in-memory DuckDB and `LOAD`s the stamped artifact.
 
-```sh
-make release DUCKDB_PLATFORM=linux_amd64        # force a platform string
-make release TARGET_TRIPLE=x86_64-apple-darwin  # cross-compile (stamper still host-arch)
-```
-
-CI (`.github/workflows/ci.yml`) builds natively on `linux_amd64` + `osx_arm64`
-runners and runs `make release` + `make test`; `release.yml` adds `osx_amd64`
-and publishes the stamped artifacts as a GitHub Release on `v*` tags.
+CI: `.github/workflows/ci.yml` runs the standard **Main Extension Distribution
+Pipeline** — per-platform smoke jobs (Linux/macOS/Windows: configure, build,
+test), then on `main`/`v*` pushes it invokes DuckDB's official
+`_extension_distribution.yml` (v1.5-variegata, `extra_toolchains: rust`) to
+produce the full platform matrix, and on `v*` tags publishes the artifacts as
+a GitHub Release. Artifacts are **unsigned** (load with `duckdb -unsigned`).
 
 ### Manual (no make)
 
@@ -98,8 +101,8 @@ and publishes the stamped artifacts as a GitHub Release on `v*` tags.
 cargo build --release --bin append_metadata
 cargo build --release --lib
 ./target/release/append_metadata \
-  target/release/libtantivy_ext.dylib \
-  tantivy.duckdb_extension \
+  target/release/libtantivy.dylib \
+  target/release/tantivy.duckdb_extension \
   --abi-type C_STRUCT --extension-version v0.1.0 \
   --duckdb-version v1.2.0 --platform osx_arm64
 ```
