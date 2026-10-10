@@ -2,7 +2,7 @@
 name = "duckdb-tantivy"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.89"
 license = "MIT"
 description = "DuckDB loadable extension: BM25 full-text search, tokenization, and Snowball stemming powered by tantivy (quack-rs binding layer, no VGI, no Arrow IPC)"
 
@@ -19,12 +19,14 @@ path = "src-bin/append_metadata/main.rs"
 
 [dependencies]
 # tantivy — the Rust full-text search engine (MIT). Pinned to the 0.24 line: its
-# MSRV is under rust-version (1.86) and it builds cleanly there; 0.25/0.26 bump
+# MSRV is under rust-version and it builds cleanly there; 0.25/0.26 bump
 # the toolchain past it. We use only the in-process RAM-directory index, its BM25
 # scoring, and its tokenizer/Snowball-stemmer stack — no on-disk index.
 tantivy = "=0.24.2"
 serde_json = "1"
-quack-rs = { path = "/Users/sa/ws/quack-rs-inspect", package = "quack-rs" }
+# quack-rs — pure-Rust wrapper over DuckDB's C Extension API (crates.io).
+# 0.18.0 is the version this code was written and tested against.
+quack-rs = "0.18.0"
 # C extension API headers/symbols; the cdylib resolves them against the host
 # DuckDB process at LOAD time.
 libduckdb-sys = { version = "1.10504", features = ["loadable-extension"] }
@@ -32,14 +34,14 @@ libduckdb-sys = { version = "1.10504", features = ["loadable-extension"] }
 [dev-dependencies]
 # SQL-level integration tests: InMemoryDb compiles a real bundled DuckDB so the
 # built .duckdb_extension can be LOADed inside `cargo test`.
-quack-rs = { path = "/Users/sa/ws/quack-rs-inspect", package = "quack-rs", features = ["bundled-test"] }
+quack-rs = { version = "0.18.0", features = ["bundled-test"] }
 duckdb = { version = "1.1.0", features = ["bundled"] }
 
 [profile.release]
-# `unwind`, not `abort`. quack-rs catches panics at every FFI boundary with
-# `std::panic::catch_unwind` and turns them into DuckDB errors; under
-# `panic = "abort"` that machinery is inert and any panic in extension code
-# takes the whole DuckDB process down.
+# `unwind`, not `abort`: every callback is wrapped in quack-rs's
+# panic-safe `*_callback!` macros (catch_unwind → set_error), so a panic in
+# extension code becomes a DuckDB error instead of aborting the host process.
+# Under `panic = "abort"` that machinery is inert.
 panic = "unwind"
 lto = true
 codegen-units = 1

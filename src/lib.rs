@@ -8,10 +8,7 @@
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use libduckdb_sys::{
-    duckdb_bind_info, duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_function_info,
-    duckdb_init_info, duckdb_vector_size,
-};
+use libduckdb_sys::{duckdb_data_chunk_get_size, duckdb_vector_size};
 use quack_rs::connection::{Connection, Registrar};
 use quack_rs::data_chunk::DataChunk;
 use quack_rs::error::ExtensionError;
@@ -98,7 +95,7 @@ struct Bm25State {
     next: usize,
 }
 
-unsafe extern "C" fn bm25_bind(info: duckdb_bind_info) {
+quack_rs::table_bind_callback!(bm25_bind, |info| {
     unsafe {
         let bind_info = BindInfo::new(info);
         // table and query are the two required POSITIONAL parameters;
@@ -122,9 +119,19 @@ unsafe extern "C" fn bm25_bind(info: duckdb_bind_info) {
             Ok(s) if !s.trim().is_empty() => s,
             _ => "english".to_string(),
         };
+        // `top_k` must be within [1, 100_000]: below 1 is a semantic error and
+        // above the cap tantivy's TopDocs allocation (2*limit) becomes a memory
+        // bomb. Out-of-range values are rejected at bind time — never silently
+        // clamped, never allowed to grow the collector unboundedly.
         let limit = match bind_info.get_named_parameter_value("top_k").as_i64() {
-            Some(v) if v >= 1 => v,
-            _ => 100,
+            Some(v) if (1..=100_000).contains(&v) => v,
+            Some(v) => {
+                bind_info.set_error(&format!(
+                    "bm25_search: top_k must be between 1 and 100000 (got {v})"
+                ));
+                return;
+            }
+            None => 100, // named arg absent (or NULL) → default
         };
 
         let id_column = id_column.trim().to_string();
@@ -187,9 +194,9 @@ unsafe extern "C" fn bm25_bind(info: duckdb_bind_info) {
             },
         );
     }
-}
+});
 
-unsafe extern "C" fn bm25_init(info: duckdb_init_info) {
+quack_rs::table_init_callback!(bm25_init, |info| {
     unsafe {
         let init_info = InitInfo::new(info);
         init_info.set_max_threads(1);
@@ -211,6 +218,7 @@ unsafe extern "C" fn bm25_init(info: duckdb_init_info) {
 
         let mut docs: Vec<search::Document> = Vec::new();
         let mut seq: i64 = 0;
+        let mut text_len = 0usize;
         {
             let Some(con) = session() else {
                 init_info.set_error("bm25_search: extension session is unavailable");
@@ -236,6 +244,20 @@ unsafe extern "C" fn bm25_init(info: duckdb_init_info) {
                                 continue; // NULL/missing text → nothing to index
                             }
                             let text = unsafe { text_reader.read_str(row) }.to_string();
+                            // Per-text bound (the scalar path applies
+                            // search::MAX_TEXT_BYTES via check_text_len; the
+                            // table path enforces it here so one 20MB row
+                            // cannot be silently indexed).
+                            if text.len() > search::MAX_TEXT_BYTES {
+                                init_info.set_error(&format!(
+                                    "bm25_search: a row in '{table}' exceeds the {b}-byte per-text limit",
+                                    table = bind.table,
+                                    b = search::MAX_TEXT_BYTES
+                                ));
+                                FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
+                                return;
+                            }
+                            text_len += text.len();
                             let id = match &id_reader {
                                 Some(r) => {
                                     if !unsafe { r.is_valid(row) } {
@@ -267,6 +289,24 @@ unsafe extern "C" fn bm25_init(info: duckdb_init_info) {
             // the (lock-free) BM25 run below.
         }
 
+        // Memory guard (P0-2): without this, an unbounded table materializes
+        // every row plus a RAM index before BM25 runs — a 20M-row table is
+        // multi-gigabytes of resident memory. The scalar path enforces these
+        // bounds via search::check_text_len / MAX_DOCS; the table path must
+        // enforce them here.
+        let text_cap = search::MAX_DOCS * 1024; // ~1KB of text per doc, worst case
+        if docs.len() > search::MAX_DOCS || text_len > text_cap {
+            init_info.set_error(&format!(
+                "bm25_search: table '{table}' has {n} rows ({t} bytes of text); the limit is {d} rows — add a WHERE clause",
+                table = bind.table,
+                n = docs.len(),
+                t = text_len,
+                d = search::MAX_DOCS
+            ));
+            FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
+            return;
+        }
+
         let hits = match search::bm25_search(&docs, &bind.query, &bind.language, bind.limit as usize)
         {
             Ok(h) => h,
@@ -278,9 +318,9 @@ unsafe extern "C" fn bm25_init(info: duckdb_init_info) {
         };
         FfiInitData::<Bm25State>::set(info, Bm25State { hits, next: 0 });
     }
-}
+});
 
-unsafe extern "C" fn bm25_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+quack_rs::table_scan_callback!(bm25_scan, |info, output| {
     unsafe {
         let chunk = DataChunk::from_raw(output);
         let Some(state) = FfiInitData::<Bm25State>::get_mut(info) else {
@@ -303,7 +343,7 @@ unsafe extern "C" fn bm25_scan(info: duckdb_function_info, output: duckdb_data_c
         state.next += batch;
         unsafe { chunk.set_size(batch) };
     }
-}
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Table function: supported_languages() → lang VARCHAR (18 rows)
@@ -313,23 +353,23 @@ struct LangState {
     next: usize,
 }
 
-unsafe extern "C" fn langs_bind(info: duckdb_bind_info) {
+quack_rs::table_bind_callback!(langs_bind, |info| {
     unsafe {
         let bind_info = BindInfo::new(info);
         bind_info
             .add_result_column("lang", TypeId::Varchar)
             .set_cardinality(search::SUPPORTED_LANGUAGES.len() as u64, true);
     }
-}
+});
 
-unsafe extern "C" fn langs_init(info: duckdb_init_info) {
+quack_rs::table_init_callback!(langs_init, |info| {
     unsafe {
         InitInfo::new(info).set_max_threads(1);
         FfiInitData::<LangState>::set(info, LangState { next: 0 });
     }
-}
+});
 
-unsafe extern "C" fn langs_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+quack_rs::table_scan_callback!(langs_scan, |info, output| {
     unsafe {
         let chunk = DataChunk::from_raw(output);
         let Some(state) = FfiInitData::<LangState>::get_mut(info) else {
@@ -347,15 +387,15 @@ unsafe extern "C" fn langs_scan(info: duckdb_function_info, output: duckdb_data_
             unsafe { writer.write_varchar(i, langs[state.next + i]) };
         }
         state.next += batch;
-        unsafe { chunk.set_size(batch) };
+        unsafe { chunk.set_size(batch) }
     }
-}
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scalar: tokenize(VARCHAR) → VARCHAR[], tokenize(VARCHAR, VARCHAR) → VARCHAR[]
 // ─────────────────────────────────────────────────────────────────────────────
 
-unsafe extern "C" fn tokenize_default_fn(info: duckdb_function_info, input: duckdb_data_chunk, output: libduckdb_sys::duckdb_vector) {
+quack_rs::scalar_callback!(tokenize_default_fn, |info, input, output| {
     unsafe {
         let reader = VectorReader::new(input, 0);
         let row_count = reader.row_count();
@@ -384,11 +424,16 @@ unsafe extern "C" fn tokenize_default_fn(info: duckdb_function_info, input: duck
                 }
             }
         }
+        // P1-2: overflow must be an error, never a silent NULL row.
+        // (checked before finish(), which consumes the builder)
+        if builder.overflowed() {
+            fn_info.set_error("tokenize: total output exceeds 1,000,000 elements per call; process smaller batches");
+        }
         builder.finish();
     }
-}
+});
 
-unsafe extern "C" fn tokenize_lang_fn(info: duckdb_function_info, input: duckdb_data_chunk, output: libduckdb_sys::duckdb_vector) {
+quack_rs::scalar_callback!(tokenize_lang_fn, |info, input, output| {
     unsafe {
         let text_reader = VectorReader::new(input, 0);
         let lang_reader = VectorReader::new(input, 1);
@@ -404,7 +449,11 @@ unsafe extern "C" fn tokenize_lang_fn(info: duckdb_function_info, input: duckdb_
             let text = text_reader.read_str(row);
             let lang = if lang_reader.is_valid(row) {
                 let l = lang_reader.read_str(row);
-                if l.trim().is_empty() { "english".to_string() } else { l.to_string() }
+                if l.trim().is_empty() {
+                    "english".to_string()
+                } else {
+                    l.to_string()
+                }
             } else {
                 "english".to_string()
             };
@@ -424,15 +473,20 @@ unsafe extern "C" fn tokenize_lang_fn(info: duckdb_function_info, input: duckdb_
                 }
             }
         }
+        // P1-2: overflow must be an error, never a silent NULL row.
+        // (checked before finish(), which consumes the builder)
+        if builder.overflowed() {
+            fn_info.set_error("tokenize: total output exceeds 1,000,000 elements per call; process smaller batches");
+        }
         builder.finish();
     }
-}
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scalar: stem(VARCHAR, VARCHAR) → VARCHAR
 // ─────────────────────────────────────────────────────────────────────────────
 
-unsafe extern "C" fn stem_fn(info: duckdb_function_info, input: duckdb_data_chunk, output: libduckdb_sys::duckdb_vector) {
+quack_rs::scalar_callback!(stem_fn, |info, input, output| {
     unsafe {
         let word_reader = VectorReader::new(input, 0);
         let lang_reader = VectorReader::new(input, 1);
@@ -456,13 +510,13 @@ unsafe extern "C" fn stem_fn(info: duckdb_function_info, input: duckdb_data_chun
             }
         }
     }
-}
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scalar: bm25_score(doc, query[, language]) → DOUBLE
 // ─────────────────────────────────────────────────────────────────────────────
 
-unsafe extern "C" fn bm25_score_2_fn(info: duckdb_function_info, input: duckdb_data_chunk, output: libduckdb_sys::duckdb_vector) {
+quack_rs::scalar_callback!(bm25_score_2_fn, |info, input, output| {
     unsafe {
         let doc_reader = VectorReader::new(input, 0);
         let query_reader = VectorReader::new(input, 1);
@@ -485,9 +539,9 @@ unsafe extern "C" fn bm25_score_2_fn(info: duckdb_function_info, input: duckdb_d
             }
         }
     }
-}
+});
 
-unsafe extern "C" fn bm25_score_3_fn(info: duckdb_function_info, input: duckdb_data_chunk, output: libduckdb_sys::duckdb_vector) {
+quack_rs::scalar_callback!(bm25_score_3_fn, |info, input, output| {
     unsafe {
         let doc_reader = VectorReader::new(input, 0);
         let query_reader = VectorReader::new(input, 1);
@@ -504,7 +558,11 @@ unsafe extern "C" fn bm25_score_3_fn(info: duckdb_function_info, input: duckdb_d
             let query = query_reader.read_str(row);
             let lang = if lang_reader.is_valid(row) {
                 let l = lang_reader.read_str(row);
-                if l.trim().is_empty() { "english".to_string() } else { l.to_string() }
+                if l.trim().is_empty() {
+                    "english".to_string()
+                } else {
+                    l.to_string()
+                }
             } else {
                 "english".to_string()
             };
@@ -517,13 +575,13 @@ unsafe extern "C" fn bm25_score_3_fn(info: duckdb_function_info, input: duckdb_d
             }
         }
     }
-}
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scalar: tantivy_version() → VARCHAR (zero-arg)
 // ─────────────────────────────────────────────────────────────────────────────
 
-unsafe extern "C" fn tantivy_version_fn(_info: duckdb_function_info, input: duckdb_data_chunk, output: libduckdb_sys::duckdb_vector) {
+quack_rs::scalar_callback!(tantivy_version_fn, |_info, input, output| {
     unsafe {
         let row_count = duckdb_data_chunk_get_size(input) as usize;
         let mut writer = VectorWriter::new(output);
@@ -532,7 +590,7 @@ unsafe extern "C" fn tantivy_version_fn(_info: duckdb_function_info, input: duck
             writer.write_varchar(row, &version);
         }
     }
-}
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Registration + entry point

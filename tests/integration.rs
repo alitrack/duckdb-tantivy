@@ -73,6 +73,7 @@ fn bm25_search_ranks_cat_docs_first() {
 #[test]
 fn bm25_search_defaults_id_text_language_limit() {
     let d = db();
+    d.execute_batch(CORPUS).unwrap();
     // 2-arg form: id_column omitted → 0-based sequence over selected rows;
     // text_column defaults to 'body', language to 'english', limit to 100.
     let top: i64 = d
@@ -87,6 +88,7 @@ fn bm25_search_defaults_id_text_language_limit() {
 #[test]
 fn bm25_search_limit_bounds_results() {
     let d = db();
+    d.execute_batch(CORPUS).unwrap();
     let n: i64 = d
         .query_one("SELECT count(*) FROM bm25_search('docs','cat', id_column:='doc_id', text_column:='body', top_k:=1)")
         .unwrap();
@@ -98,7 +100,7 @@ fn tokenize_default_overload() {
     let d = db();
     // InMemoryDb only exposes query_one<T: FromSql> and duckdb-rs has no
     // FromSql impl for Vec<T>, so assert list content via scalar access.
-    // `len()` is core in both the 1.1 bundled test build and 1.5 CLI.
+    // `len()` is core in both the bundled test build and the 1.5 CLI.
     let n: i64 = d.query_one("SELECT len(tokenize('Running quickly'))").unwrap();
     assert_eq!(n, 2, "expected 2 tokens");
     let t1: String = d.query_one("SELECT tokenize('Running quickly')[1]").unwrap();
@@ -223,5 +225,74 @@ fn tokenize_unknown_language_is_error() {
     assert!(
         msg.contains("klingon") || msg.to_lowercase().contains("language"),
         "clear language error: {msg}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hardening (added after adversarial review): top_k bounds, memory guard,
+// tokenize overflow.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn bm25_search_top_k_below_one_is_error() {
+    let d = db();
+    d.execute_batch(CORPUS).unwrap();
+    // 0 must be rejected (it used to silently fall back to 100).
+    let err = d
+        .query_one::<i64>("SELECT count(*) FROM bm25_search('docs','cat', top_k:=0)")
+        .expect_err("top_k:=0 must be an error");
+    assert!(
+        err.to_string().to_lowercase().contains("top_k"),
+        "error must name top_k: {err}"
+    );
+    // Negative values are rejected too.
+    d.query_one::<i64>("SELECT count(*) FROM bm25_search('docs','cat', top_k:=-3)")
+        .expect_err("top_k:=-3 must be an error");
+}
+
+#[test]
+fn bm25_search_top_k_above_cap_is_error() {
+    let d = db();
+    d.execute_batch(CORPUS).unwrap();
+    // i64::MAX used to overflow tantivy's TopDocs allocation and abort the
+    // whole host process (a user-triggerable DoS). It must now be rejected
+    // cleanly at bind time.
+    let err = d
+        .query_one::<i64>(
+            "SELECT count(*) FROM bm25_search('docs','cat', top_k:=9223372036854775807)",
+        )
+        .expect_err("top_k:=i64::MAX must be an error, not an abort");
+    assert!(
+        err.to_string().to_lowercase().contains("top_k"),
+        "error must name top_k: {err}"
+    );
+}
+
+#[test]
+fn bm25_search_honors_top_k_boundary() {
+    let d = db();
+    d.execute_batch(CORPUS).unwrap();
+    // The cap itself (100_000) is allowed and simply returns all 3 hits.
+    let n: i64 = d
+        .query_one(
+            "SELECT count(*) FROM bm25_search('docs','cat', top_k:=100000)",
+        )
+        .unwrap();
+    assert_eq!(n, 3, "top_k at the cap returns every hit");
+}
+
+#[test]
+fn tokenize_overflow_is_error_not_silent_null() {
+    let d = db();
+    // A single input whose tokenization exceeds the 1,000,000-element per-call
+    // cap must error out rather than emit silent NULL rows (P1-2).
+    let huge = "a ".repeat(1_000_001);
+    let err = d
+        .query_one::<i64>(&format!("SELECT len(tokenize('{}'))", huge))
+        .expect_err("tokenize overflow must be an error");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("exceeds") || msg.contains("tokenize"),
+        "clear overflow error: {err}"
     );
 }
