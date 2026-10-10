@@ -1,0 +1,17 @@
+name: Quota probe
+
+# Temporary: probes whether private artifact storage quota has freed up.
+# Uploads a 1-byte file; if upload-artifact succeeds the quota has room.
+# To be deleted once the CI run it unblocks is green.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo x > probe.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quota-probe
+          path: probe.bin
