@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux x86_64 — native on ubuntu-latest
+          - os: ubuntu-latest
+            platform: linux_amd64
+          # macOS Apple Silicon — native on the arm64 runner
+          - os: macos-14
+            platform: osx_arm64
+          # macOS Intel — native on the x86_64 runner
+          - os: macos-13
+            platform: osx_amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build + stamp
+        run: make release DUCKDB_PLATFORM=${{ matrix.platform }}
+
+      - name: Test
+        run: make test
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tantivy-${{ matrix.platform }}
+          path: tantivy.duckdb_extension
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tantivy-*
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.duckdb_extension
+          generate_release_notes: true

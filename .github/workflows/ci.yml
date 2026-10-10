@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+
+# Each platform builds natively on a matching-arch runner (no cross-compile),
+# then the in-repo append_metadata bin stamps the 512-byte DuckDB footer and we
+# run the full test suite (which compiles a bundled in-memory DuckDB to LOAD it).
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux_amd64
+          - os: macos-latest
+            platform: osx_arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build + stamp
+        run: make release DUCKDB_PLATFORM=${{ matrix.platform }}
+
+      - name: Test
+        run: make test
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tantivy-${{ matrix.platform }}
+          path: tantivy.duckdb_extension
