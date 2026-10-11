@@ -56,6 +56,10 @@ jobs:
           python-version: '3.12'
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # osx_amd64 cross-builds need the x86_64 std; on other platforms
+          # this is a no-op (host target is installed anyway).
+          targets: ${{ matrix.platform == 'osx_amd64' && 'x86_64-apple-darwin' || '' }}
 
       - uses: Swatinem/rust-cache@v2
 
