@@ -7,8 +7,9 @@ on:
 permissions:
   contents: write
 
-# One job per platform builds natively, stamps the DuckDB metadata footer, and
-# uploads the .duckdb_extension straight to the GitHub Release via
+# One job per platform builds (osx_amd64 cross-compiled on the arm64
+# macos-latest runner), stamps the DuckDB metadata footer, and uploads the
+# .duckdb_extension straight to the GitHub Release via
 # softprops/action-gh-release. No upload-artifact / download-artifact round
 # trip, so the shared artifact-storage pool is never touched (same pattern as
 # the entia release workflow).
@@ -22,9 +23,9 @@ jobs:
         include:
           - os: ubuntu-24.04
             platform: linux_amd64
-          - os: macos-15
+          - os: macos-latest
             platform: osx_arm64
-          - os: macos-13
+          - os: macos-latest
             platform: osx_amd64
           - os: windows-latest
             platform: windows_amd64
@@ -50,11 +51,11 @@ jobs:
 
       - name: Configure (venv, platform, version)
         shell: bash
-        run: make configure
+        run: make configure DUCKDB_PLATFORM=${{ matrix.platform }}
 
       - name: Build + stamp metadata
         shell: bash
-        run: make release
+        run: make release DUCKDB_PLATFORM=${{ matrix.platform }}
 
       - name: Package
         shell: bash

@@ -12,10 +12,20 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Build + test every platform natively. No upload-artifact anywhere, so this
-# workflow never touches the shared Actions artifact-storage pool (the same
-# pattern as the entia workflows). rust-cache uses the separate 10GB/repo
-# Actions-cache allowance.
+# Build + test every platform. No upload-artifact anywhere, so this workflow
+# never touches the shared Actions artifact-storage pool (same pattern as the
+# entia workflows); rust-cache uses the separate 10GB/repo Actions-cache
+# allowance.
+#
+# Platform notes:
+# - osx_amd64 is CROSS-compiled on the arm64 macos-latest runner
+#   (rust.Makefile maps DUCKDB_PLATFORM=osx_amd64 to --target
+#   x86_64-apple-darwin). The scarce macos-13 Intel runners are avoided.
+# - The cargo e2e suite (make test) compiles a bundled in-memory DuckDB from
+#   source and LOADs the stamped artifact, so it only runs when the artifact
+#   is for the runner's own architecture: skipped on Windows (no bundled
+#   DuckDB cross-build) and on the osx_amd64 cross-build (an arm64 host
+#   cannot dlopen an x86_64 extension).
 jobs:
   build:
     name: Build & test (${{ matrix.platform }})
@@ -26,15 +36,12 @@ jobs:
           - os: ubuntu-24.04
             platform: linux_amd64
             test: true
-          - os: macos-15
+          - os: macos-latest
             platform: osx_arm64
             test: true
-          - os: macos-13
+          - os: macos-latest
             platform: osx_amd64
-            test: true
-          # The cargo e2e suite compiles a bundled in-memory DuckDB from
-          # source (full C++ toolchain); it is skipped on Windows, where the
-          # build+stamp is still verified below.
+            test: false
           - os: windows-latest
             platform: windows_amd64
             test: false
@@ -59,11 +66,11 @@ jobs:
 
       - name: Configure (venv, platform, version)
         shell: bash
-        run: make configure
+        run: make configure DUCKDB_PLATFORM=${{ matrix.platform }}
 
       - name: Build + stamp metadata
         shell: bash
-        run: make release
+        run: make release DUCKDB_PLATFORM=${{ matrix.platform }}
 
       - name: Test (cargo unit + SQL-level e2e)
         if: matrix.test
