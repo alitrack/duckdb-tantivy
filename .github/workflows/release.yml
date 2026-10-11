@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+# One job per platform builds natively, stamps the DuckDB metadata footer, and
+# uploads the .duckdb_extension straight to the GitHub Release via
+# softprops/action-gh-release. No upload-artifact / download-artifact round
+# trip, so the shared artifact-storage pool is never touched (same pattern as
+# the entia release workflow).
+jobs:
+  release:
+    name: Release ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux_amd64
+          - os: macos-15
+            platform: osx_arm64
+          - os: macos-13
+            platform: osx_amd64
+          - os: windows-latest
+            platform: windows_amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: Install build tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install make -y
+
+      - name: Configure (venv, platform, version)
+        shell: bash
+        run: make configure
+
+      - name: Build + stamp metadata
+        shell: bash
+        run: make release
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/release/tantivy.duckdb_extension dist/tantivy-${{ matrix.platform }}.duckdb_extension
+          ls -la dist/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.duckdb_extension
+          fail_on_unmatched_files: true
+          generate_release_notes: false

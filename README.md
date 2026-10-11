@@ -88,12 +88,14 @@ metadata footer, producing `build/release/tantivy.duckdb_extension`
 `make test` mirrors it to `target/release/` and runs the cargo suite, which
 compiles a bundled in-memory DuckDB and `LOAD`s the stamped artifact.
 
-CI: `.github/workflows/ci.yml` runs the standard **Main Extension Distribution
-Pipeline** — per-platform smoke jobs (Linux/macOS/Windows: configure, build,
-test), then on `main`/`v*` pushes it invokes DuckDB's official
-`_extension_distribution.yml` (v1.5-variegata, `extra_toolchains: rust`) to
-produce the full platform matrix, and on `v*` tags publishes the artifacts as
-a GitHub Release. Artifacts are **unsigned** (load with `duckdb -unsigned`).
+CI: `.github/workflows/ci.yml` builds and tests natively on `linux_amd64`,
+`osx_arm64`, `osx_amd64`, and `windows_amd64` (the cargo e2e suite is skipped
+on Windows, which compiles a bundled in-memory DuckDB from source).
+`.github/workflows/release.yml` (on `v*` tags) builds the same matrix and
+uploads the stamped `tantivy-<platform>.duckdb_extension` artifacts straight
+to the GitHub Release. Neither workflow uses `upload-artifact`, so the shared
+Actions artifact-storage pool is never touched. Artifacts are **unsigned**
+(load with `duckdb -unsigned`).
 
 ### Manual (no make)
 
