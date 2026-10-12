@@ -8,6 +8,12 @@ EXT_CONFIG=$(PROJ_DIR)extension_config.cmake
 # Set to 1 to enable Unstable API
 USE_UNSTABLE_C_API=0
 
+# The stock ci-tools test target runs duckdb_sqllogictest against test/sql,
+# which this repo does not use (our e2e suite is the Rust integration tests,
+# run via `make test` in our own CI). Mirror duckdb_turbovec's pattern so the
+# DuckDB community-extensions pipeline's `make test_*` is a clean no-op.
+SKIP_TESTS=1
+
 # Target DuckDB C API version (not DuckDB release version)
 TARGET_DUCKDB_VERSION=v1.2.0
 
