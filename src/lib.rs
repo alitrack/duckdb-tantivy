@@ -6,6 +6,7 @@
 // RAM index per call; this layer plumbs SQL inputs into it and returns
 // vectors/hits back to DuckDB.
 
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use libduckdb_sys::{duckdb_data_chunk_get_size, duckdb_vector_size};
@@ -23,22 +24,145 @@ use quack_rs::vector::{ListBuilder, VectorReader, VectorWriter};
 mod search;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Session connection
+// Session connection — v0.1 single-database semantics, made loud & safe
 //
 // Table-function callbacks (bind/init/scan) have no `duckdb_connection` — the
-// C API only hands them a client context. `bm25_search` must run SQL
-// (`SELECT id, text FROM {table}`) against the user's table, so we open one
-// dedicated `OwnedConnection` during registration (from the load-time
-// database) and keep it. It holds a shared_ptr to the database instance, so it
-// stays valid for the whole session. Shared behind a `Mutex` (OwnedConnection
-// is `Send` but not `Sync`; one connection at a time is all we need — the
-// extension is otherwise stateless).
+// C API only hands them a client context, and C-API v1.2.0 provides no accessor
+// from a client context back to its `duckdb_database`. The only handle to a
+// database this extension sees is the entry point's `Connection`, so
+// `bm25_search` runs SQL (`SELECT id, text FROM {table}`) through ONE dedicated
+// `OwnedConnection` opened from the first `LOAD`'s database.
+//
+// Consequences, and how each is made safe (this was the P0 review finding):
+//
+//   * **One database per process.** The dedicated connection is bound to the
+//     FIRST database that loaded the extension. If a *second, different*
+//     database loads it, `register_all` flips `MULTI_DB` and every
+//     `bm25_search` thereafter fails with a clear error — so a query issued
+//     through the second database can no longer silently read the first
+//     database's tables. (True per-database dispatch is impossible in C-API
+//     v1.2.0: a callback cannot recover its own `duckdb_database`. The proper
+//     fix is to run corpus acquisition through the caller's query plan, which
+//     removes the dedicated connection entirely — tracked as a v0.2 task.)
+//
+//   * **Transaction visibility.** The dedicated connection has its own
+//     transaction snapshot, so `bm25_search` does NOT see the caller's
+//     uncommitted writes or temporary tables. Documented in the README; a real
+//     fix also requires the caller-plan redesign above.
+//
+//   * **Re-entry.** A `bm25_search` reached *recursively* (e.g. through a view
+//     whose definition calls `bm25_search`, while the outer search is already
+//     querying the dedicated connection) would otherwise deadlock on the
+//     session mutex or recurse to a stack overflow. A thread-local guard is set
+//     while a query runs on the dedicated connection; a nested `bm25_search`
+//     on the same thread sees it and returns a clear error instead.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The one dedicated connection, opened from the first `LOAD`'s database.
 static SESSION: OnceLock<Mutex<OwnedConnection>> = OnceLock::new();
+/// The `duckdb_database` that `SESSION` belongs to (the first loader). Used to
+/// detect when a *second, different* database loads the extension. An
+/// `AtomicPtr` rather than a `OnceLock` around a raw pointer: raw pointers are
+/// neither `Send` nor `Sync`, so a `OnceLock` holding one cannot back a
+/// `static`. The null slot is claimed with a compare-exchange, which preserves
+/// the old race semantics (first caller wins; losers keep the winner's identity).
+static FIRST_DB: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+/// Set once a second, different database loads the extension. When set, every
+/// `bm25_search` fails loudly instead of reading the first database's tables.
+static MULTI_DB: AtomicBool = AtomicBool::new(false);
 
-fn session() -> Option<MutexGuard<'static, OwnedConnection>> {
-    SESSION.get().and_then(|m| m.lock().ok())
+/// Non-zero while the *current thread* is executing a query on the dedicated
+/// connection. This is what makes re-entry detectable: a nested `bm25_search`
+/// on the same thread (a view that calls `bm25_search`) reads this and bails
+/// out with a clear error instead of deadlocking on the session mutex or
+/// recursing to a stack overflow.
+thread_local! {
+    static IN_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Why the dedicated connection could not be reached. Each maps to a distinct,
+/// actionable SQL error message (see [`SessionError::message`]).
+enum SessionError {
+    /// A `bm25_search` is already running on this thread (re-entry via a view
+    /// or nested table function).
+    Reentrant,
+    /// The extension was loaded on more than one database in this process.
+    MultiDb,
+    /// The session connection was never initialized (should not happen after a
+    /// successful `LOAD`).
+    Unavailable,
+}
+
+impl SessionError {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Reentrant => {
+                "bm25_search: nested bm25_search detected (a view or table function is \
+                 calling bm25_search while another bm25_search is executing on this \
+                 thread); this is not supported"
+            }
+            Self::MultiDb => {
+                "bm25_search: the tantivy extension was loaded on more than one database \
+                 in this process; v0.1 supports a single database instance, so searches \
+                 could not be attributed to a database (they would read the first \
+                 database's tables)"
+            }
+            Self::Unavailable => "bm25_search: the extension session is unavailable",
+        }
+    }
+}
+
+/// Set/clear the thread-local re-entry mark. Owned by [`SessionConn`] so the
+/// mark is set for exactly as long as the session lock is held and cleared on
+/// drop (even across an early return or panic in the query closure).
+struct ReentryMark;
+impl ReentryMark {
+    fn new() -> Self {
+        IN_QUERY.with(|c| c.set(true));
+        ReentryMark
+    }
+}
+impl Drop for ReentryMark {
+    fn drop(&mut self) {
+        IN_QUERY.with(|c| c.set(false));
+    }
+}
+
+/// Holds the session lock plus the re-entry mark for the current thread, both
+/// for the struct's whole lifetime. A query reached from within this query
+/// sees the mark (via [`session`]) and fails with [`SessionError::Reentrant`]
+/// rather than deadlocking on the mutex.
+struct SessionConn {
+    con: MutexGuard<'static, OwnedConnection>,
+    _mark: ReentryMark,
+}
+
+/// Reach the dedicated connection for a query, or a clear [`SessionError`].
+/// The returned guard holds the session lock and sets the thread-local
+/// re-entry mark until it is dropped.
+fn session() -> Result<SessionConn, SessionError> {
+    if IN_QUERY.with(|c| c.get()) {
+        return Err(SessionError::Reentrant);
+    }
+    if MULTI_DB.load(Ordering::SeqCst) {
+        return Err(SessionError::MultiDb);
+    }
+    let m = SESSION.get().ok_or(SessionError::Unavailable)?;
+    // `.lock()` (not `try_lock`): cross-thread concurrency on the single
+    // shared connection is serialized, preserving the pre-existing behaviour
+    // (a second concurrent search waits for the first to release the lock).
+    // Same-thread re-entry is already rejected above via the thread-local mark,
+    // so we never block on a lock this thread already holds.
+    let g = match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Ok(SessionConn { con: g, _mark: ReentryMark::new() })
+}
+
+#[cfg(test)]
+fn reentry_marked() -> bool {
+    IN_QUERY.with(|c| c.get())
 }
 
 /// A conservative identifier check: `[A-Za-z_][A-Za-z0-9_]*`, optionally
@@ -165,15 +289,15 @@ quack_rs::table_bind_callback!(bm25_bind, |info| {
             )
         };
         match session() {
-            Some(con) => match con.query(&probe) {
+            Ok(sess) => match sess.con.query(&probe) {
                 Ok(_result) => {}
                 Err(e) => {
                     bind_info.set_error(&format!("bm25_search: cannot open table '{table}': {e}"));
                     return;
                 }
             },
-            None => {
-                bind_info.set_error("bm25_search: extension session is unavailable");
+            Err(e) => {
+                bind_info.set_error(e.message());
                 return;
             }
         }
@@ -218,14 +342,76 @@ quack_rs::table_init_callback!(bm25_init, |info| {
 
         let mut docs: Vec<search::Document> = Vec::new();
         let mut seq: i64 = 0;
-        let mut text_len = 0usize;
         {
-            let Some(con) = session() else {
-                init_info.set_error("bm25_search: extension session is unavailable");
+            let sess = match session() {
+                Ok(s) => s,
+                Err(e) => {
+                    init_info.set_error(e.message());
+                    FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
+                    return;
+                }
+            };
+            // Memory guard moved BEFORE materialization (P1): a cheap aggregate
+            // probe measures the corpus (row count + cumulative text bytes)
+            // without copying a single row, so an oversized table is rejected
+            // before any of the multi-gigabyte allocations the old post-hoc
+            // check only caught *after* `docs` and the RAM index had already
+            // been built. `SUM(LENGTH(text))` is NULL-insensitive (a NULL text
+            // contributes nothing) and `COALESCE` folds an all-NULL table to 0.
+            let probe_sql = format!(
+                "SELECT count(*)::BIGINT, COALESCE(sum(LENGTH({text})::BIGINT), 0)::BIGINT \
+                 FROM {table}",
+                text = bind.text_column,
+                table = bind.table,
+            );
+            let mut p = match sess.con.query(&probe_sql) {
+                Ok(r) => r,
+                Err(e) => {
+                    init_info.set_error(&format!("bm25_search: {e}"));
+                    FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
+                    return;
+                }
+            };
+            let chunk = match p.next_chunk() {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    init_info.set_error("bm25_search: pre-check returned no rows");
+                    FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
+                    return;
+                }
+                Err(e) => {
+                    init_info.set_error(&format!("bm25_search: {e}"));
+                    FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
+                    return;
+                }
+            };
+            let r = unsafe { chunk.reader(0) };
+            let c = unsafe { chunk.reader(1) };
+            let row_count = unsafe { r.read_i64(0) } as u64;
+            let text_len = unsafe { c.read_i64(0) } as u64;
+            let text_cap = (search::MAX_DOCS * 1024) as u64; // ~1KB/doc worst case
+            if row_count > search::MAX_DOCS as u64 {
+                init_info.set_error(&format!(
+                    "bm25_search: table '{table}' has {n} rows; the limit is {d} rows — narrow the corpus with a WHERE clause or a filtered view",
+                    table = bind.table,
+                    n = row_count,
+                    d = search::MAX_DOCS
+                ));
                 FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
                 return;
-            };
-            let mut result = match con.query(&sql) {
+            }
+            if text_len > text_cap {
+                init_info.set_error(&format!(
+                    "bm25_search: table '{table}' holds {t} bytes of text across {n} rows; the limit is {cap} bytes — narrow the corpus",
+                    table = bind.table,
+                    t = text_len,
+                    n = row_count,
+                    cap = text_cap
+                ));
+                FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
+                return;
+            }
+            let mut result = match sess.con.query(&sql) {
                 Ok(r) => r,
                 Err(e) => {
                     init_info.set_error(&format!("bm25_search: {e}"));
@@ -244,10 +430,11 @@ quack_rs::table_init_callback!(bm25_init, |info| {
                                 continue; // NULL/missing text → nothing to index
                             }
                             let text = unsafe { text_reader.read_str(row) }.to_string();
-                            // Per-text bound (the scalar path applies
-                            // search::MAX_TEXT_BYTES via check_text_len; the
-                            // table path enforces it here so one 20MB row
-                            // cannot be silently indexed).
+                            // Per-text bound (the scalar path enforces this via
+                            // search::check_text_len; kept as defense-in-depth
+                            // in case one row grows between the pre-check and
+                            // here, and so a single 20MB row can never be
+                            // silently indexed).
                             if text.len() > search::MAX_TEXT_BYTES {
                                 init_info.set_error(&format!(
                                     "bm25_search: a row in '{table}' exceeds the {b}-byte per-text limit",
@@ -257,7 +444,6 @@ quack_rs::table_init_callback!(bm25_init, |info| {
                                 FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
                                 return;
                             }
-                            text_len += text.len();
                             let id = match &id_reader {
                                 Some(r) => {
                                     if !unsafe { r.is_valid(row) } {
@@ -277,34 +463,13 @@ quack_rs::table_init_callback!(bm25_init, |info| {
                     Ok(None) => break,
                     Err(e) => {
                         init_info.set_error(&format!("bm25_search: {e}"));
-                        FfiInitData::<Bm25State>::set(info, Bm25State {
-                            hits: Vec::new(),
-                            next: 0,
-                        });
+                        FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
                         return;
                     }
                 }
             }
-            // `result` and `con` drop here: the session lock is released before
-            // the (lock-free) BM25 run below.
-        }
-
-        // Memory guard (P0-2): without this, an unbounded table materializes
-        // every row plus a RAM index before BM25 runs — a 20M-row table is
-        // multi-gigabytes of resident memory. The scalar path enforces these
-        // bounds via search::check_text_len / MAX_DOCS; the table path must
-        // enforce them here.
-        let text_cap = search::MAX_DOCS * 1024; // ~1KB of text per doc, worst case
-        if docs.len() > search::MAX_DOCS || text_len > text_cap {
-            init_info.set_error(&format!(
-                "bm25_search: table '{table}' has {n} rows ({t} bytes of text); the limit is {d} rows — add a WHERE clause",
-                table = bind.table,
-                n = docs.len(),
-                t = text_len,
-                d = search::MAX_DOCS
-            ));
-            FfiInitData::<Bm25State>::set(info, Bm25State { hits: Vec::new(), next: 0 });
-            return;
+            // `result`, `p`, and `sess` (session lock + re-entry mark) drop here,
+            // before the lock-free BM25 run below.
         }
 
         let hits = match search::bm25_search(&docs, &bind.query, &bind.language, bind.limit as usize)
@@ -597,12 +762,55 @@ quack_rs::scalar_callback!(tantivy_version_fn, |_info, input, output| {
 // ─────────────────────────────────────────────────────────────────────────────
 
 unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
-    // One session connection for the lifetime of the extension, so table
-    // callbacks can run SQL (see the module note above). Idempotent in case
-    // DuckDB re-enters registration for the same process.
-    if SESSION.get().is_none() {
-        let owned = con.open_connection()?;
-        let _ = SESSION.set(Mutex::new(owned));
+    // Bind the dedicated session connection to the FIRST database that loads
+    // this extension, and make a *second, different* database loud (see the
+    // module note). `con.as_raw_database()` is the `duckdb_database` this
+    // registration belongs to; distinct databases yield distinct non-null
+    // pointers, so pointer identity is a sound database identity here.
+    let db = con.as_raw_database() as *mut ();
+    match FIRST_DB.load(Ordering::SeqCst) {
+        null if null.is_null() => {
+            // First loader in this process: open the dedicated connection from
+            // its database and claim the identity slot. A compare-exchange
+            // keeps the slot for whoever wins the race; a loser leaves the
+            // connection it already opened (the single-DB check below still
+            // catches a genuinely different second database).
+            let won = FIRST_DB.compare_exchange(
+                std::ptr::null_mut(),
+                db,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            if won.is_ok() {
+                // We are the first loader: our connection owns the session.
+                let owned = con.open_connection()?;
+                if SESSION.set(Mutex::new(owned)).is_err() {
+                    // Another thread won the SESSION race (it also loaded us
+                    // first); drop our now-redundant handle.
+                }
+            }
+            // If the compare-exchange lost, another thread already claimed
+            // the first-database identity with its own `db`; our `db` here is
+            // either the same database (single-DB case, fine) or a second
+            // database, which the check below would have caught if it had
+            // run after the claim — handle it explicitly for the loser path.
+            else {
+                let first = won.unwrap_err();
+                if db != first && !db.is_null() {
+                    MULTI_DB.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        first => {
+            // A database already loaded the extension. If this is a *different*
+            // database, we cannot attribute `bm25_search` to the right one (the
+            // C API gives a callback no way back to its database), so flag
+            // multi-database and let every search fail loudly rather than read
+            // the first database's tables.
+            if db != first && !db.is_null() {
+                MULTI_DB.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     // bm25_search(table, query, id_column := '', text_column := 'body',

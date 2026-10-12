@@ -24,11 +24,21 @@ path = "src-bin/append_metadata/main.rs"
 # scoring, and its tokenizer/Snowball-stemmer stack — no on-disk index.
 tantivy = "=0.24.2"
 serde_json = "1"
+# Unicode NFC normalization, applied to both indexed documents and queries
+# before tokenization so canonically-equivalent spellings match (see
+# search::nfc). Pure-Rust, no transitive C deps.
+unicode-normalization = "0.1"
 # quack-rs — pure-Rust wrapper over DuckDB's C Extension API (crates.io).
-# 0.18.0 is the version this code was written and tested against.
-quack-rs = "0.18.0"
+# 0.18.0 is the version this code was written and tested against; pinned
+# exactly (like tantivy) so the reviewed ABI-wrapper version can never float
+# under a caret requirement (the lockfile fixes it today, but a CI or local
+# `cargo update` would re-resolve it otherwise).
+quack-rs = "=0.18.0"
 # C extension API headers/symbols; the cdylib resolves them against the host
-# DuckDB process at LOAD time.
+# DuckDB process at LOAD time. Left as a caret so the committed Cargo.lock can
+# pin the exact resolved version (1.10506) without a manifest/lock mismatch;
+# CI and the Makefile build with `--locked` so this ABI layer can never float
+# to an unvalidated 1.x patch release.
 libduckdb-sys = { version = "1.10504", features = ["loadable-extension"] }
 
 [dev-dependencies]

@@ -30,6 +30,16 @@ use tantivy::tokenizer::{
     Token, TokenStream,
 };
 use tantivy::{doc, Index, TantivyDocument};
+use unicode_normalization::UnicodeNormalization;
+
+/// NFC-normalize `s`. Both documents and queries are normalized with this before
+/// they reach the tokenizer, so canonically-equivalent text (precomposed `café`
+/// vs decomposed `cafe\u{0301}`) yields identical tokens and can match. Without
+/// this, the same visible word could fail to match purely on its Unicode
+/// normalization form.
+fn nfc(s: &str) -> String {
+    s.nfc().collect()
+}
 
 /// Upper bound on the number of documents we will index in a single call. Far
 /// larger than the per-call corpora these functions target, but small enough to
@@ -48,7 +58,9 @@ const WRITER_HEAP_BYTES: usize = 15_000_000;
 const ANALYZER: &str = "vgi_stem";
 
 /// Errors from the analysis / search surface. All map to a clear DuckDB error.
-#[derive(Debug)]
+/// `PartialEq` is derived so tests (and callers) can compare `Result`s directly;
+/// every variant wraps a `String`, so structural equality is well-defined.
+#[derive(Debug, PartialEq)]
 pub enum SearchError {
     /// The language id is not a supported Snowball stemmer language.
     UnknownLanguage(String),
@@ -151,10 +163,14 @@ fn stem_analyzer(lang: TvLanguage) -> TextAnalyzer {
         .build()
 }
 
-/// Collect the tokens produced by an analyzer over `text`.
+/// Collect the tokens produced by an analyzer over `text`. The text is
+/// NFC-normalized first (and the same normalization is applied to indexed
+/// documents in `bm25_search`), so tokenization of canonically-equivalent
+/// Unicode spellings agrees between documents and queries.
 fn run_analyzer(mut analyzer: TextAnalyzer, text: &str) -> Vec<String> {
+    let text = nfc(text);
     let mut out = Vec::new();
-    let mut stream = analyzer.token_stream(text);
+    let mut stream = analyzer.token_stream(&text);
     stream.process(&mut |t: &Token| out.push(t.text.clone()));
     out
 }
@@ -273,12 +289,22 @@ pub fn parse_docs(docs_json: &str) -> Result<Vec<Document>> {
 }
 
 /// Build an ephemeral RAM index over `docs` (analyzed with the `lang` stemmer),
-/// run the BM25 `query`, and return up to `limit` hits ranked by descending score
-/// (ties broken by ascending doc id for determinism). Empty corpus or empty/blank
-/// query → no hits. Unknown language or unparseable query → error.
+/// run the BM25 `query`, and return up to `limit` hits ranked by descending
+/// score (ties broken by ascending doc id for determinism). Empty corpus or
+/// empty/blank query → no hits. Unknown language or unparseable query → error.
 ///
 /// The index is created in RAM, used once, and dropped on return (see the
 /// module-level *ephemeral-index semantics*).
+///
+/// **Tie-break contract, honored at the cutoff.** tantivy's `TopDocs` selects
+/// the top-K by score but makes no stability promise for *equal* scores, so
+/// `TopDocs::with_limit(K)` alone would let a small-id document lose a
+/// tie at the cutoff to an arbitrary heap ordering. We therefore collect with
+/// a limit large enough to keep **every** matching document
+/// (`limit.max(docs.len())` — a single committed RAM segment, so one collector
+/// merge), sort the full match set by `(score desc, doc_id asc)`, and only
+/// then truncate to `limit`. The documented tie-break thus holds exactly,
+/// and the extra work is bounded by the corpus size we already indexed.
 pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> Result<Vec<Hit>> {
     check_text_len(query)?;
     let l = resolve_language(lang)?;
@@ -304,8 +330,11 @@ pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> 
         .writer(WRITER_HEAP_BYTES)
         .map_err(|e| SearchError::Internal(e.to_string()))?;
     for d in docs {
+        // NFC before indexing: a precomposed and a decomposed spelling of the
+        // same word must tokenize identically (same for the query below).
+        let text = nfc(&d.text);
         writer
-            .add_document(doc!(id_field => d.id, body_field => d.text.as_str()))
+            .add_document(doc!(id_field => d.id, body_field => text.as_str()))
             .map_err(|e| SearchError::Internal(e.to_string()))?;
     }
     writer
@@ -320,14 +349,17 @@ pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> 
     let mut parser = QueryParser::for_index(&index, vec![body_field]);
     parser.set_conjunction_by_default(); // AND semantics: all terms must match.
     let parsed = parser
-        .parse_query(query)
+        .parse_query(&nfc(query))
         .map_err(|e| SearchError::BadQuery(e.to_string()))?;
 
+    // Collect enough to keep the full match set (see the fn doc for why a
+    // bare `TopDocs::with_limit(limit)` is not enough for the tie-break).
+    let collect_limit = limit.max(1).max(docs.len());
     let top = searcher
-        .search(&parsed, &TopDocs::with_limit(limit.max(1)))
+        .search(&parsed, &TopDocs::with_limit(collect_limit))
         .map_err(|e| SearchError::Internal(e.to_string()))?;
 
-    let mut hits = Vec::with_capacity(top.len());
+    let mut hits = Vec::with_capacity(top.len().min(limit.max(1)));
     for (score, addr) in top {
         let stored: TantivyDocument = searcher
             .doc(addr)
@@ -341,13 +373,16 @@ pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> 
             score: score as f64,
         });
     }
-    // Deterministic tie-break: score desc, then doc_id asc.
+    // Deterministic tie-break over the FULL match set before truncating:
+    // score desc, then doc_id asc. Truncating afterwards preserves the exact
+    // (score desc, doc_id asc) top-`limit` the API promises.
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.doc_id.cmp(&b.doc_id))
     });
+    hits.truncate(limit);
     Ok(hits)
 }
 
@@ -522,5 +557,49 @@ mod tests {
     #[test]
     fn version_string_mentions_tantivy() {
         assert!(tantivy_version().contains("tantivy"));
+    }
+
+    /// P1 tie-break regression: three documents with *identical* content
+    /// (hence identical BM25 scores) plus one non-matching doc. With
+    /// `top_k := 1` the old `TopDocs::with_limit(1)` kept an arbitrary
+    /// one of the ties (the collector makes no stability promise); the
+    /// contract is that the SMALLEST doc id wins.
+    #[test]
+    fn top_k_tie_at_cutoff_returns_smallest_doc_id() {
+        let docs = vec![
+            Document { id: 9, text: "a cat".into() },
+            Document { id: 2, text: "a cat".into() },
+            Document { id: 5, text: "a cat".into() },
+            Document { id: 1, text: "a dog".into() },
+        ];
+        let hits = bm25_search(&docs, "cat", "english", 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].doc_id, 2,
+            "equal-score tie at the cutoff must return the smallest doc id"
+        );
+        // And top_k := 3 returns all three, in ascending-id order.
+        let hits3 = bm25_search(&docs, "cat", "english", 3).unwrap();
+        assert_eq!(
+            hits3.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+            vec![2, 5, 9]
+        );
+    }
+
+    /// P1 Unicode regression: a precomposed `é` (U+00E9) and the
+    /// decomposed `e` + combining acute (U+0301) spell the same visible
+    /// word and must match each other after NFC normalization.
+    #[test]
+    fn precomposed_and_decomposed_unicode_match() {
+        let docs = vec![Document { id: 0, text: "caf\u{00E9} latte".into() }];
+        // Query with the decomposed form must still hit the precomposed doc.
+        let hits = bm25_search(&docs, "caf\u{0065}\u{0301}", "english", 10).unwrap();
+        assert_eq!(hits.len(), 1, "NFC must make both spellings match");
+        assert_eq!(hits[0].doc_id, 0);
+        // Tokenization agrees across normalization forms too.
+        assert_eq!(
+            tokenize_default("caf\u{00E9}"),
+            tokenize_default("caf\u{0065}\u{0301}")
+        );
     }
 }
