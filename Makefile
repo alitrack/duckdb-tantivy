@@ -39,6 +39,7 @@ release: build_extension_library_release build_extension_with_metadata_release
 
 test: cargo_test
 test_debug: test_extension_debug
+test_release: test_extension_release
 
 # e2e: build+stamp (release), mirror the artifact to target/release/ where the
 # Rust test harness (tests/integration.rs) LOADs it, then run the cargo suite
