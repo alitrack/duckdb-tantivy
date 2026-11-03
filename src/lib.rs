@@ -557,6 +557,240 @@ quack_rs::table_scan_callback!(langs_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Table function: tantivy_terms(table, text_column := 'body')
+//   → term VARCHAR, df BIGINT
+//
+// The raw-term (surface-form) dictionary of a table's text column: every
+// lowercased, unstemmed unicode word with its document frequency, sorted by
+// (df DESC, term ASC). This is the correction-space dictionary for the typo
+// tolerance macro layer (the fts `raw_dict` equivalent) — edit-distance
+// correction must run against surface spellings, not stems.
+//
+// Ephemeral like `bm25_search`: the dictionary is built in RAM on each call
+// from the table's current rows, with the same MAX_DOCS / text-byte guards.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct TermsBind {
+    table: String,
+    text_column: String,
+}
+
+struct TermsState {
+    terms: Vec<search::RawTerm>,
+    next: usize,
+}
+
+quack_rs::table_bind_callback!(terms_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let table = bind_info.get_parameter_value(0).as_str().unwrap_or_default();
+        let text_column = match bind_info.get_named_parameter_value("text_column").as_str() {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => "body".to_string(),
+        };
+
+        if !is_safe_identifier(&table) {
+            bind_info
+                .set_error("tantivy_terms: table_name must be an identifier like 'docs' or 'main.docs'");
+            return;
+        }
+        let text_column = text_column.trim().to_string();
+        if !is_safe_identifier(&text_column) {
+            bind_info.set_error("tantivy_terms: text_column must be an identifier (e.g. 'body')");
+            return;
+        }
+
+        let probe = format!("SELECT {text_column}::VARCHAR FROM {table} LIMIT 0");
+        match session() {
+            Ok(sess) => match sess.con.query(&probe) {
+                Ok(_result) => {}
+                Err(e) => {
+                    bind_info
+                        .set_error(&format!("tantivy_terms: cannot open table '{table}': {e}"));
+                    return;
+                }
+            },
+            Err(e) => {
+                bind_info.set_error(e.message());
+                return;
+            }
+        }
+
+        bind_info
+            .add_result_column("term", TypeId::Varchar)
+            .add_result_column("df", TypeId::BigInt)
+            .set_cardinality(0, false); // exact size unknown until the scan; unknown
+        FfiBindData::<TermsBind>::set(
+            info,
+            TermsBind {
+                table: table.trim().to_string(),
+                text_column,
+            },
+        );
+    }
+});
+
+quack_rs::table_init_callback!(terms_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+
+        let Some(bind) = FfiBindData::<TermsBind>::get_from_init(info) else {
+            FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+            return;
+        };
+
+        let sql = format!(
+            "SELECT {text}::VARCHAR AS text FROM {table}",
+            text = bind.text_column,
+            table = bind.table
+        );
+
+        let mut texts: Vec<String> = Vec::new();
+        {
+            let sess = match session() {
+                Ok(s) => s,
+                Err(e) => {
+                    init_info.set_error(e.message());
+                    FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                    return;
+                }
+            };
+            // Same cheap pre-check as bm25_search: measure before materializing.
+            let probe_sql = format!(
+                "SELECT count(*)::BIGINT, COALESCE(sum(LENGTH({text})::BIGINT), 0)::BIGINT \
+                 FROM {table}",
+                text = bind.text_column,
+                table = bind.table,
+            );
+            let mut p = match sess.con.query(&probe_sql) {
+                Ok(r) => r,
+                Err(e) => {
+                    init_info.set_error(&format!("tantivy_terms: {e}"));
+                    FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                    return;
+                }
+            };
+            let chunk = match p.next_chunk() {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    init_info.set_error("tantivy_terms: pre-check returned no rows");
+                    FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                    return;
+                }
+                Err(e) => {
+                    init_info.set_error(&format!("tantivy_terms: {e}"));
+                    FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                    return;
+                }
+            };
+            let r = unsafe { chunk.reader(0) };
+            let c = unsafe { chunk.reader(1) };
+            let row_count = unsafe { r.read_i64(0) } as u64;
+            let text_len = unsafe { c.read_i64(0) } as u64;
+            let text_cap = (search::MAX_DOCS * 1024) as u64;
+            if row_count > search::MAX_DOCS as u64 {
+                init_info.set_error(&format!(
+                    "tantivy_terms: table '{table}' has {n} rows; the limit is {d} rows — narrow the corpus with a WHERE clause or a filtered view",
+                    table = bind.table,
+                    n = row_count,
+                    d = search::MAX_DOCS
+                ));
+                FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                return;
+            }
+            if text_len > text_cap {
+                init_info.set_error(&format!(
+                    "tantivy_terms: table '{table}' holds {t} bytes of text across {n} rows; the limit is {cap} bytes — narrow the corpus",
+                    table = bind.table,
+                    t = text_len,
+                    n = row_count,
+                    cap = text_cap
+                ));
+                FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                return;
+            }
+            let mut result = match sess.con.query(&sql) {
+                Ok(r) => r,
+                Err(e) => {
+                    init_info.set_error(&format!("tantivy_terms: {e}"));
+                    FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                    return;
+                }
+            };
+            loop {
+                match result.next_chunk() {
+                    Ok(Some(chunk)) => {
+                        let d: &DataChunk = &chunk;
+                        let text_reader = unsafe { d.reader(0) };
+                        for row in 0..d.size() {
+                            if !unsafe { text_reader.is_valid(row) } {
+                                continue; // NULL/missing text → skip
+                            }
+                            let text = unsafe { text_reader.read_str(row) }.to_string();
+                            if text.len() > search::MAX_TEXT_BYTES {
+                                init_info.set_error(&format!(
+                                    "tantivy_terms: a row in '{table}' exceeds the {b}-byte per-text limit",
+                                    table = bind.table,
+                                    b = search::MAX_TEXT_BYTES
+                                ));
+                                FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                                return;
+                            }
+                            texts.push(text);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        init_info.set_error(&format!("tantivy_terms: {e}"));
+                        FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                        return;
+                    }
+                }
+            }
+            // `result`, `p`, and `sess` (session lock + re-entry mark) drop here.
+        }
+
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let terms = match search::raw_term_dictionary(&refs) {
+            Ok(t) => t,
+            Err(e) => {
+                init_info.set_error(&format!("tantivy_terms: {e}"));
+                FfiInitData::<TermsState>::set(info, TermsState { terms: Vec::new(), next: 0 });
+                return;
+            }
+        };
+        FfiInitData::<TermsState>::set(info, TermsState { terms, next: 0 });
+    }
+});
+
+quack_rs::table_scan_callback!(terms_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<TermsState>::get_mut(info) else {
+            unsafe { chunk.set_size(0) };
+            return;
+        };
+        if state.next >= state.terms.len() {
+            unsafe { chunk.set_size(0) };
+            return;
+        }
+        let batch = (state.terms.len() - state.next).min(duckdb_vector_size() as usize);
+        let mut term_writer = unsafe { chunk.writer(0) };
+        let mut df_writer = unsafe { chunk.writer(1) };
+        for i in 0..batch {
+            let t = &state.terms[state.next + i];
+            unsafe {
+                term_writer.write_varchar(i, t.term.as_str());
+                df_writer.write_i64(i, t.df);
+            }
+        }
+        state.next += batch;
+        unsafe { chunk.set_size(batch) }
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Scalar: tokenize(VARCHAR) → VARCHAR[], tokenize(VARCHAR, VARCHAR) → VARCHAR[]
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -837,6 +1071,16 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .bind(langs_bind)
             .init(langs_init)
             .scan(langs_scan),
+    )?;
+
+    // tantivy_terms(table, text_column := 'body') → term VARCHAR, df BIGINT
+    con.register_table(
+        TableFunctionBuilder::new("tantivy_terms")
+            .param(TypeId::Varchar)
+            .named_param("text_column", TypeId::Varchar)
+            .bind(terms_bind)
+            .init(terms_init)
+            .scan(terms_scan),
     )?;
 
     con.register_scalar_set(

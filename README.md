@@ -12,6 +12,7 @@ JSON shims: table functions bind to real tables and stream real columns.
 | Function | Description |
 |---|---|
 | `bm25_search(table, query, [id_column := ''], [text_column := 'body'], [language := 'english'], [top_k := 100])` | BM25 search over a table → `doc_id BIGINT, score DOUBLE` |
+| `tantivy_terms(table, [text_column := 'body'])` | Raw-term (unstemmed, lowercased) dictionary of the table → `term VARCHAR, df BIGINT`. Document-frequency per term; the correction-space dictionary for typo-tolerance macro layers. |
 | `supported_languages()` | The 18 Snowball languages tantivy can stem |
 | `tokenize(text)` / `tokenize(text, language)` | Tokenize (+ stem if language given) → `VARCHAR[]` |
 | `stem(word, language)` | Snowball-stem a single word |

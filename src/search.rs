@@ -407,6 +407,61 @@ pub fn tantivy_version() -> String {
     tantivy::version_string().to_string()
 }
 
+/// A term from the raw-term dictionary: the lowercased, unstemmed surface form
+/// and how many documents it occurs in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawTerm {
+    pub term: String,
+    pub df: i64,
+}
+
+/// Build the **raw-term dictionary** for a corpus of text bodies: every
+/// lowercased, unicode-word token (no stemming — the `default` analyzer),
+/// with its document frequency (how many distinct texts contain it).
+///
+/// This is the correction-space counterpart of a stemmed BM25 index: typo
+/// correction compares edit distances against *surface* spellings (`cruide`
+/// is one edit from `crude`, but both stem to `crud`, so a stemmed dictionary
+/// cannot distinguish them). Search still runs against the stemmed index —
+/// the query-side stemmer maps a corrected surface form back to the indexed
+/// term, so the two spaces are bridged at query time.
+///
+/// `df` counts documents, not occurrences (the same word three times in one
+/// text still counts once) — it ranks equally-close correction candidates by
+/// corpus frequency, exactly like a `raw_dict(df)` table would.
+///
+/// Terms are returned sorted by `(df DESC, term ASC)` so the most frequent
+/// first is the one a `LIMIT 1` correction candidate picks.
+///
+/// Bounds: [`MAX_DOCS`] texts and [`MAX_TEXT_BYTES`] per text, same as
+/// `bm25_search`; a corpus that violates them is an error, never a silent
+/// truncation.
+pub fn raw_term_dictionary(texts: &[&str]) -> Result<Vec<RawTerm>> {
+    if texts.len() > MAX_DOCS {
+        return Err(SearchError::TooLarge(format!(
+            "{} texts exceeds the limit of {MAX_DOCS}",
+            texts.len()
+        )));
+    }
+    let mut df: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for t in texts {
+        check_text_len(t)?;
+        // Per-text seen set: df counts documents, not token occurrences.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for tok in run_analyzer(default_analyzer(), t) {
+            if seen.insert(tok.clone()) {
+                *df.entry(tok).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut out: Vec<RawTerm> = df
+        .into_iter()
+        .map(|(term, df)| RawTerm { term, df })
+        .collect();
+    out.sort_by(|a, b| b.df.cmp(&a.df).then_with(|| a.term.cmp(&b.term)));
+    Ok(out)
+}
+
 /// Enforce the per-text-value size bound.
 fn check_text_len(text: &str) -> Result<()> {
     if text.len() > MAX_TEXT_BYTES {
@@ -441,6 +496,44 @@ mod tests {
                 text: "the stock market crashed and finance suffered".into(),
             },
         ]
+    }
+
+    #[test]
+    fn raw_term_dictionary_counts_documents_not_occurrences() {
+        let texts = [
+            "the cat sat on the mat",       // "the" x2 in one doc → counts once
+            "a cat and a dog",
+            "the dog barks at the cat",     // "the" x2 again, "cat", "dog"
+        ];
+        let dict = raw_term_dictionary(&texts).unwrap();
+        let get = |t: &str| -> i64 { dict.iter().find(|r| r.term == t).unwrap().df };
+        // "cat" appears in docs 0,1,2 → df 3; "dog" in 1,2 → df 2; "the" in 0,2 → df 2.
+        assert_eq!(get("cat"), 3, "cat in all three docs");
+        assert_eq!(get("dog"), 2, "dog in docs 1 and 2");
+        assert_eq!(get("the"), 2, "the counts per-document despite x2 in one doc");
+        assert_eq!(get("barks"), 1);
+        // Sorted by df desc, then term asc: cat(3) first, then dog/the(2) in order.
+        assert_eq!(dict[0].term, "cat");
+        assert_eq!(dict[1].term, "dog");
+        assert_eq!(dict[2].term, "the");
+    }
+
+    #[test]
+    fn raw_term_dictionary_lowercases_and_strips_punct() {
+        let texts = ["Cat, CAT! cat-sitter", "crude oil"];
+        let dict = raw_term_dictionary(&texts).unwrap();
+        let get = |t: &str| -> Option<i64> { dict.iter().find(|r| r.term == t).map(|r| r.df) };
+        // All "Cat"/"CAT"/"cat" lowercase to one term; punctuation splits words.
+        assert_eq!(get("cat"), Some(1));
+        assert_eq!(get("cat-sitter"), None, "hyphen is a token boundary");
+        assert_eq!(get("sitter"), Some(1));
+        assert_eq!(get("crude"), Some(1));
+        assert!(get("Cat").is_none(), "dictionary is lowercase-only");
+    }
+
+    #[test]
+    fn raw_term_dictionary_empty_corpus_is_empty() {
+        assert!(raw_term_dictionary(&[]).unwrap().is_empty());
     }
 
     #[test]
