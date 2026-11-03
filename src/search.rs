@@ -349,7 +349,7 @@ pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> 
     let mut parser = QueryParser::for_index(&index, vec![body_field]);
     parser.set_conjunction_by_default(); // AND semantics: all terms must match.
     let parsed = parser
-        .parse_query(&nfc(query))
+        .parse_query(&sanitize_query(&nfc(query)))
         .map_err(|e| SearchError::BadQuery(e.to_string()))?;
 
     // Collect enough to keep the full match set (see the fn doc for why a
@@ -400,6 +400,35 @@ pub fn bm25_score(doc_text: &str, query: &str, lang: &str) -> Result<f64> {
     }];
     let hits = bm25_search(&docs, query, lang, 1)?;
     Ok(hits.first().map(|h| h.score).unwrap_or(0.0))
+}
+
+/// Escape tantivy query-parser metacharacters so that a caller-supplied
+/// string is searched as **plain text**: every word is a term, with no
+/// field syntax (`:`), grouping (`(` `)`), operators (`+` `-` `!` `*`),
+/// ranges (`>` `<` `=`), boosts (`~`), or quoting (`"`).
+///
+/// News headlines and user input routinely contain these (`"Enter your
+/// e-mail: ..."`, `"Q2: strong quarter (40%)"`); without sanitizing they
+/// turn into `BadQuery` errors (a `:` with no field before it is a syntax
+/// error in the tantivy parser). The escape is character-for-character,
+/// so tokenization (unicode word-split + stemmer) is untouched and only
+/// the parser's special meaning is neutralized.
+///
+/// One subtlety: a `"` that is itself preceded by a surviving `\` is
+/// *escaped* (`\"` in the output) rather than left bare — a bare `"` in
+/// the query would otherwise start an unterminated phrase.
+pub fn sanitize_query(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() + 8);
+    for c in q.chars() {
+        match c {
+            '\\' | '"' | ':' | '(' | ')' | '+' | '-' | '!' | '=' | '>' | '<' | '~' | '*' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The tantivy version string, e.g. `"tantivy v0.24.2, index_format v7"`.
@@ -534,6 +563,34 @@ mod tests {
     #[test]
     fn raw_term_dictionary_empty_corpus_is_empty() {
         assert!(raw_term_dictionary(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sanitize_query_escapes_metacharacters_but_keeps_words() {
+        // The real-world trigger: a headline with a colon in it.
+        assert_eq!(sanitize_query("enter your e-mail: archos"),
+                   "enter your e\\-mail\\: archos");
+        assert_eq!(sanitize_query("q2: strong quarter (40%)"),
+                   "q2\\: strong quarter \\(40%\\)");
+        assert_eq!(sanitize_query("a-b +c \"d\" e*f"),
+                   "a\\-b \\+c \\\"d\\\" e\\*f");
+        // Plain words, digits and unicode pass through untouched.
+        assert_eq!(sanitize_query("crude oil refinery"), "crude oil refinery");
+        assert_eq!(sanitize_query("café 40% done"), "café 40% done");
+    }
+
+    #[test]
+    fn colon_headline_searches_instead_of_erroring() {
+        // Before sanitization, "e-mail:" is a field reference and the parser
+        // raises BadQuery; now the words search as plain text (AND semantics:
+        // the doc must contain both "e-mail" and "archos" — it does).
+        let docs = vec![Document {
+            id: 0,
+            text: "Enter your e-mail: Archos has turned".into(),
+        }];
+        let hits = bm25_search(&docs, "Enter your e-mail: Archos", "english", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, 0);
     }
 
     #[test]

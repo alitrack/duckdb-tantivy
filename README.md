@@ -62,6 +62,18 @@ SELECT bm25_score('the cat sat','cat');      -- 0.28...
 - **Auto row ids** (`id_column := ''`) are 0-based sequence numbers over the
   indexed rows *in table scan order* — they are not stable across table
   mutations or filters. Pass a real `id_column` when you need stable ids.
+- **Query semantics are conjunctive (AND)**: every word in the query must
+  match (tantivy `set_conjunction_by_default`). A misspelled word or a word
+  absent from the corpus yields *zero* results for the whole query. For
+  typo tolerance this is why the companion macro layer (duckdb-vss
+  `test/tantivy_typo.sql`) fuses the original and corrected queries with
+  two-arm RRF instead of merging them into one search.
+- **Query text is escaped before parsing.** The query string is fed through
+  `sanitize_query`, which backslash-escapes the tantivy query-parser
+  metacharacters (`\ : ( ) + - ! = > < ~ * "`), so `bm25_search('docs',
+  'e-mail: archos (40%)')` searches as plain words instead of raising a
+  `BadQuery` syntax error. Field syntax and phrase quoting in queries are
+  therefore not available by design.
 - `id_column` must be castable to `BIGINT`; non-integer id columns are not
   supported.
 - The in-repo CI/release workflows build for `linux_amd64`, `osx_arm64`,
