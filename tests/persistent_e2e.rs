@@ -1,0 +1,199 @@
+//! Cross-process persistent-index e2e (v0.3) — driven by
+//! `scripts/run_persistent_e2e.sh` (`E2E_OUT=<dir>`).
+//!
+//! Each `cargo test` invocation is a FRESH OS process (fresh registry):
+//!
+//!   `fresh_process_save`  — create two tables (english + chinese), build two
+//!                           persistent indexes, `tantivy_save_index` both to
+//!                           copies, and dump:
+//!                             * persistent search results (both languages)
+//!                             * ephemeral `bm25_search` results, same params
+//!                           to CSVs in $E2E_OUT.
+//!
+//!   `fresh_process_load`  — in a DIFFERENT fresh process, `tantivy_load_index`
+//!                           both saved copies under new names and dump the
+//!                           SAME searches to CSVs.
+//!
+//!   `fresh_process_perf_100k` — 100k-row build + searches with timings.
+//!
+//! The script then `diff`s the CSVs:
+//!   * `search*_create` vs `search*_load`   → bit-identical across processes
+//!   * `search*_ephemeral` vs `search*_create` → bm25_search ==
+//!                                              tantivy_search_index, same
+//!                                              params, same results
+//!
+//! These tests are `#[ignore]`d from the regular suite (they need $E2E_OUT);
+//! the in-process coverage lives in `tests/integration.rs`.
+
+use quack_rs::testing::InMemoryDb;
+
+const EN_CORPUS: &str = r#"
+CREATE OR REPLACE TABLE docs(doc_id BIGINT, body VARCHAR);
+INSERT INTO docs VALUES
+  (0, 'the cat sat on the warm mat'),
+  (1, 'a curious cat chased the laser dot'),
+  (2, 'the loyal dog barked at the mailman'),
+  (3, 'the stock market crashed and finance suffered'),
+  (4, 'cats fish and cat birds');
+"#;
+
+const ZH_CORPUS: &str = r#"
+CREATE OR REPLACE TABLE zh_docs(doc_id BIGINT, body VARCHAR);
+INSERT INTO zh_docs VALUES
+  (0, '苹果发布了新款手机'),
+  (1, '华为的麒麟芯片很强大'),
+  (2, '北京大学的计算机系招生'),
+  (3, '今天天气很好适合出门运动'),
+  (4, '苹果 苹果 股票 苹果');
+"#;
+
+fn load_db() -> InMemoryDb {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/release/tantivy.duckdb_extension");
+    assert!(
+        path.exists(),
+        "build first: scripts/run_persistent_e2e.sh (or make release)"
+    );
+    let d = InMemoryDb::open_unsigned().expect("open in-memory db");
+    d.execute_batch(&format!("LOAD '{}'", path.display()))
+        .expect("load extension");
+    d
+}
+
+fn out_dir() -> String {
+    std::env::var("E2E_OUT")
+        .expect("E2E_OUT not set — run via scripts/run_persistent_e2e.sh")
+}
+
+fn dump(d: &InMemoryDb, out: &str, file: &str, query: &str) {
+    d.execute_batch(&format!("COPY ({query}) TO '{out}/{file}.csv' (HEADER)")
+        .expect("copy out"));
+}
+
+#[test]
+#[ignore]
+fn fresh_process_save() {
+    let out = out_dir();
+    let d = load_db();
+    d.execute_batch(EN_CORPUS).unwrap();
+    d.execute_batch(ZH_CORPUS).unwrap();
+
+    let en_dir = format!("{out}/en_index");
+    let en_copy = format!("{out}/en_index_copy");
+    let zh_dir = format!("{out}/zh_index");
+    let zh_copy = format!("{out}/zh_index_copy");
+
+    d.execute_batch(&format!(
+        "SELECT * FROM tantivy_create_index('e2e_en','docs', id_column:='doc_id', text_column:='body', language:='english', path:='{en_dir}')"
+    ))
+    .unwrap();
+    d.execute_batch(&format!(
+        "SELECT * FROM tantivy_save_index('e2e_en', path:='{en_copy}')"
+    ))
+    .unwrap();
+    d.execute_batch(&format!(
+        "SELECT * FROM tantivy_create_index('e2e_zh','zh_docs', id_column:='doc_id', text_column:='body', language:='chinese', path:='{zh_dir}')"
+    ))
+    .unwrap();
+    d.execute_batch(&format!(
+        "SELECT * FROM tantivy_save_index('e2e_zh', path:='{zh_copy}')"
+    ))
+    .unwrap();
+
+    // Persistent searches (this process, on the freshly built indices).
+    dump(&d, &out, "search_create",
+        "SELECT doc_id, score FROM tantivy_search_index('e2e_en','cat', top_k:=10) ORDER BY doc_id");
+    dump(&d, &out, "search2_create",
+        "SELECT doc_id, score FROM tantivy_search_index('e2e_en','stock market', top_k:=10) ORDER BY doc_id");
+    dump(&d, &out, "search_zh_create",
+        "SELECT doc_id, score FROM tantivy_search_index('e2e_zh','苹果', top_k:=10) ORDER BY doc_id");
+
+    // Ephemeral references: identical parameters to bm25_search (default top_k
+    // there is 100 — pass the same top_k:=10 as above for an exact cross-check).
+    dump(&d, &out, "search_ephemeral",
+        "SELECT doc_id, score FROM bm25_search('docs','cat', id_column:='doc_id', text_column:='body', language:='english', top_k:=10) ORDER BY doc_id");
+    dump(&d, &out, "search2_ephemeral",
+        "SELECT doc_id, score FROM bm25_search('docs','stock market', id_column:='doc_id', text_column:='body', language:='english', top_k:=10) ORDER BY doc_id");
+    dump(&d, &out, "search_zh_ephemeral",
+        "SELECT doc_id, score FROM bm25_search('zh_docs','苹果', id_column:='doc_id', text_column:='body', language:='chinese', top_k:=10) ORDER BY doc_id");
+
+    eprintln!("SAVE phase: 3 persistent + 3 ephemeral CSVs written to {out}");
+}
+
+#[test]
+#[ignore]
+fn fresh_process_load() {
+    let out = out_dir();
+    let d = load_db();
+    // A DIFFERENT fresh process: the registry starts empty. Load both saved
+    // copies under new names — no table access needed at all.
+    let en_copy = format!("{out}/en_index_copy");
+    let zh_copy = format!("{out}/zh_index_copy");
+
+    let summary: String = d
+        .query_one(&format!(
+            "SELECT name || '|' || docs::VARCHAR || '|' || language FROM tantivy_load_index('e2e_en_loaded','{en_copy}')"
+        ))
+        .unwrap();
+    assert_eq!(summary, "e2e_en_loaded|5|english", "loaded summary: {summary}");
+
+    let summary_zh: String = d
+        .query_one(&format!(
+            "SELECT name || '|' || docs::VARCHAR || '|' || language FROM tantivy_load_index('e2e_zh_loaded','{zh_copy}')"
+        ))
+        .unwrap();
+    assert_eq!(summary_zh, "e2e_zh_loaded|5|chinese", "loaded summary: {summary_zh}");
+
+    // The SAME searches as the save phase — the script diffs these files.
+    dump(&d, &out, "search_load",
+        "SELECT doc_id, score FROM tantivy_search_index('e2e_en_loaded','cat', top_k:=10) ORDER BY doc_id");
+    dump(&d, &out, "search2_load",
+        "SELECT doc_id, score FROM tantivy_search_index('e2e_en_loaded','stock market', top_k:=10) ORDER BY doc_id");
+    dump(&d, &out, "search_zh_load",
+        "SELECT doc_id, score FROM tantivy_search_index('e2e_zh_loaded','苹果', top_k:=10) ORDER BY doc_id");
+
+    eprintln!("LOAD phase: 3 CSVs written to {out} (fresh process)");
+}
+
+#[test]
+#[ignore]
+fn fresh_process_perf_100k() {
+    let out = out_dir();
+    let d = load_db();
+    d.execute_batch(
+        "CREATE OR REPLACE TABLE big_docs(id BIGINT, body VARCHAR);
+         INSERT INTO big_docs SELECT i, 'the quick brown fox ' || (i % 97) || ' jumps over the lazy dog ' || (i % 3) FROM range(100000) t(i)",
+    )
+    .unwrap();
+    let dir = format!("{out}/big_index");
+
+    let t0 = std::time::Instant::now();
+    let summary: String = d
+        .query_one(&format!(
+            "SELECT name || '|' || docs::VARCHAR FROM tantivy_create_index('big_idx','big_docs', id_column:='id', path:='{dir}')"
+        ))
+        .unwrap();
+    let build_ms = t0.elapsed().as_millis();
+    assert_eq!(summary, "big_idx|100000", "all 100k rows indexed: {summary}");
+
+    let t1 = std::time::Instant::now();
+    let n1: i64 = d
+        .query_one("SELECT count(*) FROM tantivy_search_index('big_idx','quick fox', top_k:=100)")
+        .unwrap();
+    let t2 = std::time::Instant::now();
+    let n2: i64 = d
+        .query_one("SELECT count(*) FROM tantivy_search_index('big_idx','lazy dog', top_k:=1000)")
+        .unwrap();
+    let search_ms = t1.elapsed().as_millis() + t2.elapsed().as_millis();
+    assert!(n1 > 0 && n1 <= 100, "n1={n1}");
+    assert!(n2 > 0 && n2 <= 1000, "n2={n2}");
+
+    std::fs::write(
+        format!("{out}/perf.txt"),
+        format!("build_ms={build_ms}\nsearch_ms={search_ms}\nn1={n1}\nn2={n2}\n"),
+    )
+    .unwrap();
+    eprintln!(
+        "PERF 100k: build={build_ms}ms, 2 searches={search_ms}ms (n1={n1}, n2={n2})"
+    );
+}
