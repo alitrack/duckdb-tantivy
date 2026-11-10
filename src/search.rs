@@ -19,19 +19,30 @@
 //! text (never executed). Malformed JSON, unknown languages and malformed queries
 //! surface as clear errors; empty corpora / empty queries yield no results rather
 //! than panicking. The extension never panics on caller input.
+//!
+//! ## Persistent indexes (v0.3)
+//! On top of the ephemeral surface, this module also builds **named on-disk
+//! (mmap-backed) indexes** ([`PersistentIndex`]): `create_persistent` builds
+//! one from a corpus in a directory the caller owns, `open_persistent`
+//! reopens it read-only, and `persistent_search` queries it with EXACTLY the
+//! same semantics and tie-break contract as [`bm25_search`] — so a persistent
+//! index and a fresh ephemeral search over the same corpus return identical
+//! `(doc_id, score)` rows (the v0.3 cross-check guarantee).
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use jieba_rs::Jieba;
 use tantivy::collector::TopDocs;
+use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
-use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED};
+use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED};
 use tantivy::tokenizer::{
     Language as TvLanguage, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
     Token, TokenStream, Tokenizer,
 };
-use tantivy::{doc, Index, TantivyDocument};
+use tantivy::{doc, Index, IndexReader, Searcher, TantivyDocument};
 use unicode_normalization::UnicodeNormalization;
 
 /// NFC-normalize `s`. Both documents and queries are normalized with this before
@@ -363,7 +374,7 @@ pub fn stem(word: &str, lang: &str) -> Result<String> {
 }
 
 /// A single search hit: the caller's document id and its BM25 score.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
     pub doc_id: i64,
     pub score: f64,
@@ -660,6 +671,388 @@ fn check_text_len(text: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistent (on-disk, mmap-backed) index — the v0.3 counterpart of the
+// ephemeral index above.
+//
+// A named tantivy index that lives in a directory on disk: built ONCE from a
+// corpus, then searched repeatedly without rebuilding. The binding layer
+// (lib.rs) keeps one of these per name in a process-global registry and
+// exposes them through the `tantivy_create_index` / `tantivy_search_index`
+// / `tantivy_list` / `tantivy_save_index` / `tantivy_load_index` table
+// functions.
+//
+//   * `create_persistent` — create or REBUILD the index in a directory the
+//     caller owns (the directory is wiped first, like CREATE OR REPLACE);
+//   * `open_persistent`   — reopen an existing index directory read-only;
+//   * `persistent_search` — search with EXACTLY the query semantics and
+//     tie-break contract of [`bm25_search`] (full match set kept, sorted
+//     score-desc / doc-id-asc, then truncated at the cutoff).
+//
+// Provenance: every index directory carries a [`INDEX_META_FILE`] sidecar
+// recording the name/language it was built with. [`open_persistent`] refuses
+// directories without that sidecar (a foreign or corrupt index is a clear
+// error, never a guess).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The sidecar file (inside an index directory) recording which name/language
+/// the index was built with.
+pub const INDEX_META_FILE: &str = "__tantivy_meta.json";
+
+/// A persistent, named tantivy index on disk. Cheap to share behind an `Arc`:
+/// `reader` and `searcher_handle` are `Arc`-based tantivy handles, and the
+/// index is IMMUTABLE after creation (a rebuild is a fresh `create_persistent`)
+/// — so the stored `searcher_handle` snapshot never goes stale.
+pub struct PersistentIndex {
+    /// The registry key chosen by the caller (also written into the meta file).
+    pub name: String,
+    /// The on-disk directory this index was created in / opened from.
+    pub path: String,
+    /// The tantivy reader. Intentionally never read directly (all searches go
+    /// through `searcher_handle`); it is retained so the index's directory
+    /// handle stays alive for the handle's lifetime. (`Debug` is implemented
+    /// manually below because tantivy's reader/searcher types don't derive it.
+    ///)
+    #[allow(dead_code)]
+    pub reader: IndexReader,
+    /// A searcher pinned to the committed snapshot; used for all searches.
+    pub searcher_handle: Searcher,
+    /// The stored i64 document-id field.
+    pub id_field: Field,
+    /// The analyzed text-body field.
+    pub body_field: Field,
+    /// The resolved (alias-normalized) language id the index was built with,
+    /// e.g. `"chinese"`.
+    pub language: String,
+    /// Number of documents in the index — the match-set bound for the
+    /// tie-break collector, exactly as in [`bm25_search`].
+    pub num_docs: usize,
+}
+
+impl fmt::Debug for PersistentIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersistentIndex")
+            .field("name", &self.name)
+            .field("path", &self.path)
+            .field("language", &self.language)
+            .field("num_docs", &self.num_docs)
+            .finish()
+    }
+}
+
+/// Conservative index-name check: a single path segment —
+/// `[A-Za-z_][A-Za-z0-9_-]*`, at most 128 chars. Names double as directory
+/// names, so separators, dots and traversal characters are rejected.
+pub fn is_safe_index_name(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 128 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
+        return false;
+    }
+    bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+}
+
+/// The default on-disk location of a persistent index: the `TANTIVY_INDEX_DIR`
+/// environment variable (if set and non-empty) plus the index name, else
+/// `.tantivy_index/<name>` under the current working directory.
+pub fn persistent_index_dir(name: &str) -> PathBuf {
+    let base = std::env::var("TANTIVY_INDEX_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new(".tantivy_index").to_path_buf());
+    base.join(name)
+}
+
+/// The canonical language id for a resolved [`Lang`] (alias-normalized: both
+/// `"zh"` and `"CHINESE"` report as `"chinese"`).
+pub fn lang_id(l: &Lang) -> &'static str {
+    match l {
+        Lang::Chinese => "chinese",
+        Lang::Snowball(t) => match t {
+            TvLanguage::Arabic => "arabic",
+            TvLanguage::Danish => "danish",
+            TvLanguage::Dutch => "dutch",
+            TvLanguage::English => "english",
+            TvLanguage::Finnish => "finnish",
+            TvLanguage::French => "french",
+            TvLanguage::German => "german",
+            TvLanguage::Greek => "greek",
+            TvLanguage::Hungarian => "hungarian",
+            TvLanguage::Italian => "italian",
+            TvLanguage::Norwegian => "norwegian",
+            TvLanguage::Portuguese => "portuguese",
+            TvLanguage::Romanian => "romanian",
+            TvLanguage::Russian => "russian",
+            TvLanguage::Spanish => "spanish",
+            TvLanguage::Swedish => "swedish",
+            TvLanguage::Tamil => "tamil",
+            TvLanguage::Turkish => "turkish",
+        },
+    }
+}
+
+/// Recursively remove everything inside `dir` (the directory itself is kept).
+fn wipe_dir(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let p = entry?.path();
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p)?;
+        } else {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
+}
+
+/// Create (or REBUILD) the persistent index `name` in `dir`, indexing all of
+/// `docs` with the `lang` analyzer, and return an open handle.
+///
+/// `dir` is caller-owned: it is created if missing and WIPED if non-empty
+/// (rebuild semantics — like `CREATE OR REPLACE`, never a silent append).
+/// A [`INDEX_META_FILE`] sidecar recording name/language is written into `dir`
+/// for provenance (see [`open_persistent`]).
+pub fn create_persistent(
+    name: &str,
+    dir: &Path,
+    lang: &str,
+    docs: &[Document],
+) -> Result<PersistentIndex> {
+    if !is_safe_index_name(name) {
+        return Err(SearchError::Internal(format!(
+            "invalid index name '{name}' (expected a single segment like 'my_index')"
+        )));
+    }
+    let l = resolve_language(lang)?;
+    if docs.len() > MAX_DOCS {
+        return Err(SearchError::TooLarge(format!(
+            "{} documents exceeds the limit of {MAX_DOCS}",
+            docs.len()
+        )));
+    }
+
+    wipe_dir(dir).map_err(|e| {
+        SearchError::Internal(format!(
+            "cannot prepare index directory '{}': {e}",
+            dir.display()
+        ))
+    })?;
+    std::fs::create_dir_all(dir).map_err(|e| {
+        SearchError::Internal(format!(
+            "cannot create index directory '{}': {e}",
+            dir.display()
+        ))
+    })?;
+
+    let mmap = MmapDirectory::open(dir).map_err(|e| {
+        SearchError::Internal(format!(
+            "cannot mmap index directory '{}': {e}",
+            dir.display()
+        ))
+    })?;
+    // Same schema shape as `bm25_search`: a stored i64 id + an analyzed body.
+    let mut sb = Schema::builder();
+    let id_field = sb.add_i64_field("id", STORED);
+    let text_opts = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(ANALYZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    );
+    let body_field = sb.add_text_field("body", text_opts);
+    let schema = sb.build();
+
+    let index = Index::open_or_create(mmap, schema).map_err(|e| {
+        SearchError::Internal(format!(
+            "cannot open index in '{}': {e}",
+            dir.display()
+        ))
+    })?;
+    index.tokenizers().register(ANALYZER, analyzer_for(&l));
+
+    let mut writer = index
+        .writer(WRITER_HEAP_BYTES)
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+    for d in docs {
+        // NFC before indexing (same contract as bm25_search).
+        let text = nfc(&d.text);
+        writer
+            .add_document(doc!(id_field => d.id, body_field => text.as_str()))
+            .map_err(|e| SearchError::Internal(e.to_string()))?;
+    }
+    writer
+        .commit()
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+    drop(writer); // release the directory lockfile before reopening read-only
+
+    let reader = index
+        .reader()
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+    let searcher = reader.searcher();
+
+    let num_docs = searcher.num_docs() as usize;
+
+    // Provenance sidecar: a failure here fails the whole create (kept
+    // symmetric with `open_persistent`, which requires the file).
+    let meta = format!(
+        "{{\"name\":{},\"language\":{}}}",
+        serde_json::to_string(name).map_err(|e| SearchError::Internal(e.to_string()))?,
+        serde_json::to_string(lang_id(&l)).map_err(|e| SearchError::Internal(e.to_string()))?
+    );
+    std::fs::write(dir.join(INDEX_META_FILE), meta).map_err(|e| {
+        SearchError::Internal(format!(
+            "cannot write {INDEX_META_FILE} in '{}': {e}",
+            dir.display()
+        ))
+    })?;
+
+    Ok(PersistentIndex {
+        name: name.to_string(),
+        path: dir.to_string_lossy().into_owned(),
+        reader,
+        searcher_handle: searcher,
+        id_field,
+        body_field,
+        language: lang_id(&l).to_string(),
+        num_docs,
+    })
+}
+
+/// Reopen an existing persistent index from `dir` (read-only) and return a
+/// handle registered under `name`. Errors clearly when `dir` holds no
+/// tantivy index, when the schema lacks the `id`/`body` fields, or when the
+/// provenance sidecar is missing (foreign/corrupt directory).
+pub fn open_persistent(name: &str, dir: &Path) -> Result<PersistentIndex> {
+    if !is_safe_index_name(name) {
+        return Err(SearchError::Internal(format!(
+            "invalid index name '{name}' (expected a single segment like 'my_index')"
+        )));
+    }
+    let index = Index::open_in_dir(dir).map_err(|e| {
+        SearchError::Internal(format!(
+            "no tantivy index found at '{}': {e}",
+            dir.display()
+        ))
+    })?;
+    // Provenance first: a directory without our sidecar is a foreign/corrupt
+    // index, and that is the most diagnostic error to surface.
+    let meta_text = std::fs::read_to_string(dir.join(INDEX_META_FILE)).map_err(|_| {
+        SearchError::Internal(format!(
+            "index at '{}' is missing its {INDEX_META_FILE} provenance file; only \n             indexes created by tantivy_create_index can be loaded",
+            dir.display()
+        ))
+    })?;
+    let meta: serde_json::Value = serde_json::from_str(&meta_text).map_err(|e| {
+        SearchError::Internal(format!(
+            "corrupt {INDEX_META_FILE} at '{}': {e}",
+            dir.display()
+        ))
+    })?;
+    let language = meta
+        .get("language")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            SearchError::Internal(format!(
+                "corrupt {INDEX_META_FILE} at '{}' (no language)",
+                dir.display()
+            ))
+        })?
+        .to_string();
+    // A reopened Index carries an EMPTY tokenizer manager (managers are
+    // per-process and never persisted) — re-register the build-time analyzer
+    // or the QueryParser cannot resolve the body field's tokenizer.
+    let l = resolve_language(&language)?;
+    index.tokenizers().register(ANALYZER, analyzer_for(&l));
+
+    let schema = index.schema();
+    let id_field = schema.get_field("id").map_err(|e| {
+        SearchError::Internal(format!(
+            "index at '{}' has no 'id' field ({e}); only indexes created by \n             tantivy_create_index can be loaded",
+            dir.display()
+        ))
+    })?;
+    let body_field = schema.get_field("body").map_err(|e| {
+        SearchError::Internal(format!(
+            "index at '{}' has no 'body' field ({e}); only indexes created by \n             tantivy_create_index can be loaded",
+            dir.display()
+        ))
+    })?;
+
+    let reader = index
+        .reader()
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+    let searcher = reader.searcher();
+    let num_docs = searcher.num_docs() as usize;
+
+    Ok(PersistentIndex {
+        name: name.to_string(),
+        path: dir.to_string_lossy().into_owned(),
+        reader,
+        searcher_handle: searcher,
+        id_field,
+        body_field,
+        language,
+        num_docs,
+    })
+}
+
+/// Search a persistent index. Same query semantics as [`bm25_search`]: NFC +
+/// metacharacter-sanitized, conjunction (AND) by default, and the documented
+/// tie-break honored at the cutoff (the full match set is kept, sorted score
+/// desc / doc id asc, then truncated to `limit`) — so results are
+/// bit-identical to an ephemeral `bm25_search` over the same corpus with the
+/// same parameters. Empty/blank query → no hits; malformed query →
+/// [`SearchError::BadQuery`].
+pub fn persistent_search(idx: &PersistentIndex, query: &str, limit: usize) -> Result<Vec<Hit>> {
+    check_text_len(query)?;
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let searcher = &idx.searcher_handle;
+    let mut parser = QueryParser::for_index(searcher.index(), vec![idx.body_field]);
+    parser.set_conjunction_by_default(); // AND semantics: all terms must match.
+    let parsed = parser
+        .parse_query(&sanitize_query(&nfc(query)))
+        .map_err(|e| SearchError::BadQuery(e.to_string()))?;
+
+    // Keep the FULL match set before the cutoff (same contract as bm25_search:
+    // TopDocs makes no stability promise for equal scores at the limit).
+    let collect_limit = limit.max(1).max(idx.num_docs);
+    let top = searcher
+        .search(&parsed, &TopDocs::with_limit(collect_limit))
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+
+    let mut hits = Vec::with_capacity(top.len().min(limit.max(1)));
+    for (score, addr) in top {
+        let stored: TantivyDocument = searcher
+            .doc(addr)
+            .map_err(|e| SearchError::Internal(e.to_string()))?;
+        let doc_id = stored
+            .get_first(idx.id_field)
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| SearchError::Internal("stored doc missing id".into()))?;
+        hits.push(Hit {
+            doc_id,
+            score: score as f64,
+        });
+    }
+    // Deterministic tie-break over the FULL match set before truncating.
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    hits.truncate(limit);
+    Ok(hits)
 }
 
 #[cfg(test)]
@@ -1007,4 +1400,178 @@ mod tests {
             assert!(n >= min, "expected >= {min} tokens for {text:?}, got {n}");
         }
     }
+
+    // ── persistent (on-disk) index ───────────────────────────────────────────
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "duckdb_tantivy_test_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn persistent_index_roundtrip_matches_bm25_search() {
+        let docs = corpus();
+        let dir = tmp_dir("roundtrip");
+        let idx = create_persistent("idx_en", &dir, "english", &docs).unwrap();
+        assert_eq!(idx.language, "english");
+        assert_eq!(idx.num_docs, docs.len());
+        for q in ["cat", "finance market", "no_such_word_zzz", "   "] {
+            let eph = bm25_search(&docs, q, "english", 10).unwrap();
+            let pers = persistent_search(&idx, q, 10).unwrap();
+            assert_eq!(eph, pers, "query {q:?}: persistent must equal ephemeral");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistent_search_tie_break_matches_contract() {
+        let docs = vec![
+            Document { id: 9, text: "a cat".into() },
+            Document { id: 2, text: "a cat".into() },
+            Document { id: 5, text: "a cat".into() },
+            Document { id: 1, text: "a dog".into() },
+        ];
+        let dir = tmp_dir("tie");
+        let idx = create_persistent("tie_idx", &dir, "english", &docs).unwrap();
+        let one = persistent_search(&idx, "cat", 1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            one[0].doc_id, 2,
+            "equal-score tie at the cutoff must return the smallest doc id"
+        );
+        let three = persistent_search(&idx, "cat", 3).unwrap();
+        assert_eq!(
+            three.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+            vec![2, 5, 9]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistent_search_chinese_corpus() {
+        let docs = vec![
+            Document { id: 0, text: "苹果发布了新款手机".into() },
+            Document { id: 1, text: "华为的麒麟芯片很强大".into() },
+            Document { id: 4, text: "苹果 苹果 股票 苹果".into() },
+        ];
+        let dir = tmp_dir("zh");
+        let idx = create_persistent("zh_idx", &dir, "chinese", &docs).unwrap();
+        assert_eq!(idx.language, "chinese");
+        let hits = persistent_search(&idx, "苹果", 10).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+            vec![4, 0],
+            "doc 4 (3x 苹果) first, then doc 0"
+        );
+        // Must equal the ephemeral chinese search on the same corpus.
+        assert_eq!(bm25_search(&docs, "苹果", "chinese", 10).unwrap(), hits);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_persistent_rebuilds_wiped_directory() {
+        let dir = tmp_dir("rebuild");
+        let docs1 = vec![Document { id: 1, text: "zebra".into() }];
+        create_persistent("rb", &dir, "english", &docs1).unwrap();
+        // Second build with different content replaces (not appends) the first.
+        let docs2 = vec![Document { id: 2, text: "giraffe".into() }];
+        let idx = create_persistent("rb", &dir, "english", &docs2).unwrap();
+        assert_eq!(idx.num_docs, 1, "rebuild must not append to the old segment");
+        assert!(persistent_search(&idx, "zebra", 10).unwrap().is_empty());
+        assert!(!persistent_search(&idx, "giraffe", 10).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_persistent_recovers_language_and_searches() {
+        let docs = corpus();
+        let dir = tmp_dir("reopen");
+        create_persistent("idx_zh", &dir, "chinese", &docs).unwrap();
+        let opened = open_persistent("idx_zh", &dir).unwrap();
+        assert_eq!(opened.language, "chinese");
+        assert_eq!(opened.num_docs, docs.len());
+        assert!(!persistent_search(&opened, "cat", 10).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_persistent_rejects_foreign_directory_without_meta() {
+        // A genuine tantivy index on disk, but NOT created by us: no meta
+        // sidecar. `open_persistent` must refuse it with a clear error.
+        let dir = tmp_dir("foreign");
+        let mut sb = Schema::builder();
+        let f = sb.add_text_field("body", TextOptions::default());
+        let index =
+            Index::open_or_create(MmapDirectory::open(&dir).unwrap(), sb.build()).unwrap();
+        let mut writer = index.writer(WRITER_HEAP_BYTES).unwrap();
+        writer.add_document(doc!(f => "hello")).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        let e = open_persistent("foreign_idx", &dir).unwrap_err();
+        assert!(
+            e.to_string().contains(INDEX_META_FILE),
+            "must cite the missing provenance file: {e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_persistent_missing_directory_is_error() {
+        let e =
+            open_persistent("ghost", Path::new("/nonexistent/definitely_not_here_12345"))
+                .unwrap_err();
+        assert!(
+            e.to_string().contains("no tantivy index"),
+            "clear missing-index error: {e}"
+        );
+    }
+
+    #[test]
+    fn create_persistent_unknown_language_is_error() {
+        let docs = corpus();
+        let dir = tmp_dir("badlang");
+        let e = create_persistent("bad", &dir, "klingon", &docs).unwrap_err();
+        assert!(matches!(e, SearchError::UnknownLanguage(_)), "got: {e:?}");
+    }
+
+    #[test]
+    fn is_safe_index_name_rules() {
+        assert!(is_safe_index_name("my_index"));
+        assert!(is_safe_index_name("idx-2"));
+        assert!(is_safe_index_name("_x"));
+        assert!(!is_safe_index_name(""));
+        assert!(!is_safe_index_name("a/b"));
+        assert!(!is_safe_index_name(".."));
+        assert!(!is_safe_index_name("a b"));
+        assert!(!is_safe_index_name("9lives"));
+        assert!(!is_safe_index_name("中文索引"));
+        assert!(!is_safe_index_name(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn persistent_index_dir_default_location() {
+        // No TANTIVY_INDEX_DIR in the test environment → .tantivy_index/<name>.
+        std::env::remove_var("TANTIVY_INDEX_DIR");
+        let p = persistent_index_dir("foo");
+        assert!(
+            p.to_string_lossy().contains(".tantivy_index"),
+            "default base, got: {p:?}"
+        );
+        assert!(p.to_string_lossy().ends_with("foo"));
+    }
+
+    #[test]
+    fn lang_id_normalizes_aliases() {
+        assert_eq!(lang_id(&resolve_language("zh").unwrap()), "chinese");
+        assert_eq!(lang_id(&resolve_language("CHINESE").unwrap()), "chinese");
+        assert_eq!(lang_id(&resolve_language("ENGLISH").unwrap()), "english");
+        assert_eq!(lang_id(&resolve_language("fr").unwrap()), "french");
+    }
 }
+
