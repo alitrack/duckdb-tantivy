@@ -16,7 +16,7 @@ JSON shims: table functions bind to real tables and stream real columns.
 | `tantivy_search_index(name, query, [top_k := 10])` | BM25 search against a registered persistent index → `doc_id BIGINT, score DOUBLE`. Same query semantics and tie-break as `bm25_search` → identical results (v0.3) |
 | `tantivy_list()` | The registered persistent indexes → `name, path, docs, language` (v0.3) |
 | `tantivy_save_index(name, [path := ''])` | Copy a registered index's directory to `path` (or report where it lives without `path`) → `name, path, docs` (v0.3) |
-| `tantivy_load_index(name, path)` | Open a previously saved index directory (from any process) read-only and register it under `name` → `name, path, docs, language` (v0.3) |
+| `tantivy_load_index(name, path := '...')` | Open a previously saved index directory (from any process) read-only and register it under `name` — `path` is a named parameter (style-consistent with `save`) but **required** → `name, path, docs, language` (v0.3) |
 | `tantivy_terms(table, [text_column := 'body'])` | Raw-term (unstemmed, lowercased) dictionary of the table → `term VARCHAR, df BIGINT`. Document-frequency per term; the correction-space dictionary for typo-tolerance macro layers. |
 | `supported_languages()` | The 18 Snowball languages tantivy can stem, plus `chinese (jieba)` |
 | `tokenize(text)` / `tokenize(text, language)` | Tokenize (+ stem if language given) → `VARCHAR[]`. `language := 'chinese'` (alias `zh`) uses jieba word segmentation instead of Snowball |
@@ -104,7 +104,7 @@ SELECT * FROM tantivy_list();
 SELECT * FROM tantivy_save_index('news', path := '/backup/news_index');
 
 -- in a fresh process (or under a new name): open it and search
-SELECT * FROM tantivy_load_index('news_copy', '/backup/news_index');
+SELECT * FROM tantivy_load_index('news_copy', path := '/backup/news_index');
 ```
 
 Semantics:

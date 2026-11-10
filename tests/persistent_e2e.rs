@@ -132,14 +132,14 @@ fn fresh_process_load() {
 
     let summary: String = d
         .query_one(&format!(
-            "SELECT name || '|' || docs::VARCHAR || '|' || language FROM tantivy_load_index('e2e_en_loaded','{en_copy}')"
+            "SELECT name || '|' || docs::VARCHAR || '|' || language FROM tantivy_load_index('e2e_en_loaded', path:='{en_copy}')"
         ))
         .unwrap();
     assert_eq!(summary, "e2e_en_loaded|5|english", "loaded summary: {summary}");
 
     let summary_zh: String = d
         .query_one(&format!(
-            "SELECT name || '|' || docs::VARCHAR || '|' || language FROM tantivy_load_index('e2e_zh_loaded','{zh_copy}')"
+            "SELECT name || '|' || docs::VARCHAR || '|' || language FROM tantivy_load_index('e2e_zh_loaded', path:='{zh_copy}')"
         ))
         .unwrap();
     assert_eq!(summary_zh, "e2e_zh_loaded|5|chinese", "loaded summary: {summary_zh}");
@@ -212,7 +212,7 @@ fn fresh_process_m9_chinese_100k_load() {
     let d = load_db();
     let copy = format!("{out}/m9_index_copy");
     d.execute_batch(&format!(
-        "SELECT * FROM tantivy_load_index('m9ci_loaded','{copy}')"
+        "SELECT * FROM tantivy_load_index('m9ci_loaded', path:='{copy}')"
     )).unwrap();
 
     // Persistent (FRESH process B) — must be bit-identical to process A.

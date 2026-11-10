@@ -1717,15 +1717,17 @@ quack_rs::table_scan_callback!(save_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Table function: tantivy_load_index(name, path)
+// Table function: tantivy_load_index(name, path := '...')
 //   → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
 //
 // Opens the persistent index stored at `path` (a directory produced by
 // `tantivy_create_index` / `tantivy_save_index` in any process) read-only and
-// registers it under `name` in THIS process's registry. The registry is
-// process-global, so `name` must not already be registered here (clear error;
-// v0.3 has no drop function — replace an index by rebuilding it under a fresh
-// name or in a fresh process).
+// registers it under `name` in THIS process's registry. `path` is a NAMED
+// parameter (style-consistent with `tantivy_save_index`'s `path := ...`), but
+// it is REQUIRED: omitting it (or passing NULL/empty) is a bind-time error.
+// The registry is process-global, so `name` must not already be registered
+// here (clear error; v0.3 has no drop function — replace an index by
+// rebuilding it under a fresh name or in a fresh process).
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LoadBind {
@@ -1745,7 +1747,13 @@ quack_rs::table_bind_callback!(load_bind, |info| {
     unsafe {
         let bind_info = BindInfo::new(info);
         let name = bind_info.get_parameter_value(0).as_str().unwrap_or_default();
-        let path = bind_info.get_parameter_value(1).as_str().unwrap_or_default();
+        // `path` is a NAMED parameter (style match with `tantivy_save_index`),
+        // so it cannot be read positionally: read it by name. Missing/null/
+        // empty all fall through to the required-`path` error below.
+        let path = match bind_info.get_named_parameter_value("path").as_str() {
+            Ok(s) if !s.trim().is_empty() => s.to_string(),
+            _ => String::new(),
+        };
 
         if !search::is_safe_index_name(&name) {
             bind_info.set_error(
@@ -2195,11 +2203,13 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .scan(save_scan),
     )?;
 
-    // tantivy_load_index(name, path) → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+    // tantivy_load_index(name, path := '...') → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+    // (`path` is a named parameter like `tantivy_save_index`'s, but required —
+    //  omitting it is a bind-time error; positional `path` no longer binds.)
     con.register_table(
         TableFunctionBuilder::new("tantivy_load_index")
             .param(TypeId::Varchar)
-            .param(TypeId::Varchar)
+            .named_param("path", TypeId::Varchar)
             .bind(load_bind)
             .init(load_init)
             .scan(load_scan),

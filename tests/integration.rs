@@ -754,7 +754,7 @@ fn persistent_save_and_load_roundtrip_same_process() {
 
     // 3) load the copy under a NEW name → identical search results.
     d.execute_batch(&format!(
-        "SELECT * FROM tantivy_load_index('sv_loaded','{}')",
+        "SELECT * FROM tantivy_load_index('sv_loaded', path:='{}')",
         dir_b.display()
     ))
     .unwrap();
@@ -789,7 +789,7 @@ fn search_meta_name() -> String {
 fn persistent_load_missing_path_is_error() {
     let d = db();
     let err = d
-        .query_one::<i64>("SELECT count(*) FROM tantivy_load_index('lz_missing','/nonexistent_xyz/nowhere_42')")
+        .query_one::<i64>("SELECT count(*) FROM tantivy_load_index('lz_missing', path:='/nonexistent_xyz/nowhere_42')")
         .expect_err("missing path must be an error");
     let msg = err.to_string();
     assert!(
@@ -823,7 +823,7 @@ fn persistent_load_name_conflict_is_error() {
     // Loading the SAME already-registered name is a clear error (no overwrite).
     let err = d
         .query_one::<i64>(&format!(
-            "SELECT count(*) FROM tantivy_load_index('clash_ci','{}')",
+            "SELECT count(*) FROM tantivy_load_index('clash_ci', path:='{}')",
             dir_b.display()
         ))
         .expect_err("name conflict must be an error");
