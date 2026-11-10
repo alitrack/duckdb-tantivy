@@ -4,3 +4,4 @@ configure/
 *.duckdb_extension
 *.so
 *.dylib
+laneC_report.md
