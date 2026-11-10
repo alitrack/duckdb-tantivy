@@ -2,9 +2,10 @@
 // stemming, powered by tantivy.
 //
 // This file is a thin quack-rs binding layer over `search.rs` (a pure Rust
-// search core with no DuckDB dependency). The search core builds an ephemeral
-// RAM index per call; this layer plumbs SQL inputs into it and returns
-// vectors/hits back to DuckDB.
+// search core with no DuckDB dependency). The search core offers an ephemeral
+// RAM index per call (bm25_search, tantivy_terms, ...) and, since v0.3, named
+// on-disk (mmap-backed) persistent indexes; this layer plumbs SQL inputs into
+// it and returns vectors/hits back to DuckDB.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -236,7 +237,9 @@ fn is_safe_identifier(s: &str) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Table function: bm25_search(table, query, id_column, text_column, language, limit)
+// Table function: bm25_search(table, query,
+//   [id_column := ''], [text_column := 'body'], [language := 'english'],
+//   [top_k := 100])
 //   → doc_id BIGINT, score DOUBLE
 //
 // bind  : read + validate parameters; confirm the table and columns exist

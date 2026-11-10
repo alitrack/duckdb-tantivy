@@ -20,8 +20,9 @@ path = "src-bin/append_metadata/main.rs"
 [dependencies]
 # tantivy — the Rust full-text search engine (MIT). Pinned to the 0.24 line: its
 # MSRV is under rust-version and it builds cleanly there; 0.25/0.26 bump
-# the toolchain past it. We use only the in-process RAM-directory index, its BM25
-# scoring, and its tokenizer/Snowball-stemmer stack — no on-disk index.
+# the toolchain past it. We use its BM25 scoring, its tokenizer/Snowball-stemmer
+# stack, its in-process RAM-directory index (ephemeral searches), and — since
+# v0.3 — its MmapDirectory for persistent on-disk named indexes.
 tantivy = "=0.24.2"
 serde_json = "1"
 # jieba-rs — Chinese word segmentation (MIT). Pinned to the 0.7 line per the

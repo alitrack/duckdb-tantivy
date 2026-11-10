@@ -7,16 +7,22 @@ Extension API (ABI v1.2.0) through
 [quack-rs](https://github.com/tomtom215/quack-rs). No VGI, no Arrow IPC, no
 JSON shims: table functions bind to real tables and stream real columns.
 
+**Current release: v0.3.0** — persistent named indexes
+(`tantivy_create_index` / `tantivy_search_index` / `tantivy_save_index` /
+`tantivy_load_index` / `tantivy_list`) on top of the v0.2 BM25 surface.
+DuckDB C Extension API v1.2.0; artifacts are **unsigned** (load with
+`duckdb -unsigned`).
+
 ## Function surface
 
 | Function | Description |
 |---|---|
 | `bm25_search(table, query, [id_column := ''], [text_column := 'body'], [language := 'english'], [top_k := 100])` | BM25 search over a table → `doc_id BIGINT, score DOUBLE` |
-| `tantivy_create_index(name, table, [id_column := ''], [text_column := 'body'], [language := 'english'], [path := ''])` | Build a **persistent** on-disk (mmap-backed) index `name` from a table and register it in the process → `name, path, docs, language` (v0.3) |
-| `tantivy_search_index(name, query, [top_k := 10])` | BM25 search against a registered persistent index → `doc_id BIGINT, score DOUBLE`. Same query semantics and tie-break as `bm25_search` → identical results (v0.3) |
-| `tantivy_list()` | The registered persistent indexes → `name, path, docs, language` (v0.3) |
-| `tantivy_save_index(name, [path := ''])` | Copy a registered index's directory to `path` (or report where it lives without `path`) → `name, path, docs` (v0.3) |
-| `tantivy_load_index(name, path := '...')` | Open a previously saved index directory (from any process) read-only and register it under `name` — `path` is a named parameter (style-consistent with `save`) but **required** → `name, path, docs, language` (v0.3) |
+| `tantivy_create_index(name, table, [id_column := ''], [text_column := 'body'], [language := 'english'], [path := ''])` | Build a **persistent** on-disk (mmap-backed) index `name` from a table and register it in the process → `name, path, docs, language` (v0.3.0) |
+| `tantivy_search_index(name, query, [top_k := 10])` | BM25 search against a registered persistent index → `doc_id BIGINT, score DOUBLE`. Same query semantics and tie-break as `bm25_search` → identical results (v0.3.0) |
+| `tantivy_list()` | The registered persistent indexes → `name, path, docs, language` (v0.3.0) |
+| `tantivy_save_index(name, [path := ''])` | Copy a registered index's directory to `path` (or report where it lives without `path`) → `name, path, docs` (v0.3.0) |
+| `tantivy_load_index(name, path := '...')` | Open a previously saved index directory (from any process) read-only and register it under `name` — `path` is a named parameter (style-consistent with `save`) but **required** → `name, path, docs, language` (v0.3.0) |
 | `tantivy_terms(table, [text_column := 'body'])` | Raw-term (unstemmed, lowercased) dictionary of the table → `term VARCHAR, df BIGINT`. Document-frequency per term; the correction-space dictionary for typo-tolerance macro layers. |
 | `supported_languages()` | The 18 Snowball languages tantivy can stem, plus `chinese (jieba)` |
 | `tokenize(text)` / `tokenize(text, language)` | Tokenize (+ stem if language given) → `VARCHAR[]`. `language := 'chinese'` (alias `zh`) uses jieba word segmentation instead of Snowball |
@@ -86,11 +92,46 @@ To rebuild and re-verify the whole chain from scratch (offline, rebuild + stamp 
 bash scripts/run_chinese_e2e.sh
 ```
 
-## Persistent indexes (v0.3)
+## Persistent named indexes (v0.3.0)
 
-The v0.2 surface is *ephemeral*: every `bm25_search` rebuilds a RAM index. v0.3
-adds **named persistent indexes** — built once from a table, stored on disk in
-a directory (mmap-backed, no background server), and searched repeatedly:
+The v0.2 surface is *ephemeral*: every `bm25_search` call rebuilds a RAM index
+from the table, searches once, and throws the index away. v0.3.0 adds **named
+persistent indexes** — built once from a table, stored on disk in a directory
+(mmap-backed, no background server), and searched any number of times, with
+results **bit-identical** to `bm25_search` over the same rows.
+
+### Functions
+
+| Function | Returns |
+|---|---|
+| `tantivy_create_index(name, table, [id_column := ''], [text_column := 'body'], [language := 'english'], [path := ''])` | `name, path, docs, language` |
+| `tantivy_search_index(name, query, [top_k := 10])` | `doc_id BIGINT, score DOUBLE` |
+| `tantivy_save_index(name, [path := ''])` | `name, path, docs` |
+| `tantivy_load_index(name, path := '...')` | `name, path, docs, language` |
+| `tantivy_list()` | `name, path, docs, language` |
+
+- `tantivy_create_index` builds (or **rebuilds** — the index directory is
+  wiped first, `CREATE OR REPLACE` semantics, never a silent append) the
+  on-disk index `name` from the table's current rows and registers it in the
+  process-global registry. Default location: `$TANTIVY_INDEX_DIR/<name>`,
+  else `.tantivy_index/<name>` in the working directory.
+- `tantivy_search_index` runs a BM25 query against a registered index: the
+  same query pipeline (NFC, metacharacter sanitization, conjunctive/AND
+  matching, score-desc/doc-id-asc tie-break at the cutoff) as `bm25_search`,
+  so both return **bit-identical** `(doc_id, score)` rows for the same corpus
+  and parameters. Search touches no table.
+- `tantivy_save_index` copies the index directory to `path` — a full,
+  loadable copy including the provenance sidecar — or, with no `path`, simply
+  reports where the index lives. An existing, non-empty destination is
+  refused (never an overwrite).
+- `tantivy_load_index` opens a previously saved directory (created in any
+  process) read-only and registers it under `name`. `path` is a named
+  parameter (style-matched to `save`) but **required**: omitting it is a
+  bind-time error.
+- `tantivy_list` snapshots the process's registry, one row per registered
+  index, sorted by name.
+
+### Example: build → search → save → load in a fresh process
 
 ```sql
 -- build once (default location: $TANTIVY_INDEX_DIR/<name>, else .tantivy_index/<name>)
@@ -103,32 +144,94 @@ SELECT * FROM tantivy_list();
 -- back it up / move it to another machine (or report where it lives)
 SELECT * FROM tantivy_save_index('news', path := '/backup/news_index');
 
--- in a fresh process (or under a new name): open it and search
+-- in a FRESH process (or under a new name): open it and search
 SELECT * FROM tantivy_load_index('news_copy', path := '/backup/news_index');
+SELECT * FROM tantivy_search_index('news_copy', 'crude oil', top_k := 20);
 ```
 
-Semantics:
+### Chinese (jieba)
 
-- **Same ranking as `bm25_search`.** `tantivy_search_index` uses exactly the
-  same query pipeline (NFC normalization, metacharacter sanitization,
-  conjunctive/AND matching, and the score-desc/doc-id-asc tie-break honored at
-  the cutoff), so a persistent index and a fresh `bm25_search` over the same
-  rows with the same parameters return **bit-identical** `(doc_id, score)`
-  rows. The e2e harness diffs exactly that across fresh processes (english and
-  chinese) and enforces it on every run.
-- **The index is immutable.** `tantivy_create_index` *rebuilds*: the index
-  directory is wiped and re-indexed from the table's current rows (like
-  `CREATE OR REPLACE` — never a silent append). There is no incremental
-  update and no `drop` in v0.3: replace an index by rebuilding it under a
-  fresh name, or in a fresh process.
+```sql
+CREATE TABLE zh_docs(doc_id BIGINT, body VARCHAR);
+INSERT INTO zh_docs VALUES
+  (0, '苹果发布了新款手机'),
+  (4, '苹果 苹果 股票 苹果');
+
+SELECT * FROM tantivy_create_index('zh', 'zh_docs', id_column := 'doc_id',
+                                   language := 'chinese');
+SELECT * FROM tantivy_search_index('zh', '苹果 股票');
+-- doc_id | score
+--      4 | ...   -- conjunctive (AND): only doc 4 contains both terms
+
+-- in a fresh process (default dir: .tantivy_index/zh):
+SELECT * FROM tantivy_load_index('zh2', path := '.tantivy_index/zh');
+SELECT * FROM tantivy_search_index('zh2', '苹果 股票');  -- identical rows
+```
+
+### Persistent vs ephemeral — which to use
+
+- **Use `bm25_search` (ephemeral)** for one-off or ad-hoc searches, for
+  tables that change between queries (it always sees the current rows), or
+  when you don't want to manage index names and files.
+- **Use a persistent index** when you search the same corpus repeatedly (no
+  per-query table scan or rebuild), when you need reproducible results across
+  processes/machines (`save` → `load`), or when per-call rebuilds would hurt.
+  Trade-off: an index is a *snapshot* — it does not see table changes made
+  after the build; refresh it by rebuilding (v0.3.0 has no incremental
+  update).
+
+### Semantics and guarantees
+
+- **Same ranking as `bm25_search`.** The e2e harness diffs persistent vs
+  ephemeral results across fresh processes (english and chinese) and enforces
+  bit-identity on every run.
+- **The index is immutable.** There is no incremental update and no `drop`
+  in v0.3.0: replace an index by rebuilding it under a fresh name, or in a
+  fresh process.
 - **The registry is process-global.** Registered indexes live for the life of
   the DuckDB process, in a process-wide registry (like duckdb-vss's). Loading
   a name that is already registered is a clear error.
 - **Provenance.** Every index directory carries a `__tantivy_meta.json`
   sidecar (name + language); `tantivy_load_index` refuses directories without
   it (foreign or corrupt index → clear error, never a guess).
-- `language := 'chinese'` (jieba) works exactly as in `bm25_search` — a saved
-  Chinese index loads and searches identically in a fresh process.
+
+### Known limitations (v0.3.0)
+
+- **The registry is process-global and has no drop.** Indexes registered in a
+  DuckDB process stay registered until the process exits; there is no
+  `tantivy_drop_index`. To replace an index, rebuild it under a different
+  name (or in a fresh process); on-disk directories outlive the process and
+  can be moved, backed up, or deleted by hand.
+- **`path` on `tantivy_create_index` takes ownership of that directory**
+  (wiped on every rebuild) — never point it at a directory whose contents
+  you need.
+- **Same corpus rules as `bm25_search`:** `id_column` must be castable to
+  `BIGINT`; temporary tables and uncommitted transactions are not visible to
+  the corpus read (session-connection limitation, see *Known limitations*
+  below); 1,000,000-row + proportional text-bytes pre-flight cap; 16 MiB per
+  text value.
+- **No incremental updates** — changes to the source table after the build
+  are not reflected; rebuild the index.
+
+### Performance (synthetic corpus, measured)
+
+Fresh-process, release-build measurements on a 100k-row synthetic corpus
+(`scripts/run_persistent_e2e.sh` step 6; in-suite smoke test
+`persistent_index_100k_rows`):
+
+- **Index build: ≈ 0.3–0.7 s** (0.3 s in our CI-class run, 0.7 s on the
+  coordinator's WSL machine — machine-dependent).
+- **Search: tens of ms per query** — two searches (top_k 100 / 1000) totaled
+  ≈ 46 ms in our run, including the SQL round-trip; no table access, no
+  rebuild.
+- **Cross-process bit-identical:** after `save` → fresh-process `load`,
+  persistent results diff empty against both the pre-save index and an
+  ephemeral `bm25_search` with identical parameters — six CSV diffs (english
+  + chinese) in the standard cross-process step, plus six more on the 100k-row
+  Chinese acceptance corpus.
+
+These are order-of-magnitude smoke numbers on synthetic corpora, not a
+benchmark; the test suite asserts generous bounds, not thresholds.
 
 To rebuild and re-verify the persistent chain (offline, full suite +
 cross-process save→load bit-identity diffs + 100k-row performance, exit 0 = all
@@ -174,7 +277,7 @@ bash scripts/run_persistent_e2e.sh
   therefore not available by design.
 - `id_column` must be castable to `BIGINT`; non-integer id columns are not
   supported.
-- **Persistent indexes are process-scoped with no drop (v0.3).** The registry
+- **Persistent indexes are process-scoped with no drop (v0.3.0).** The registry
   is process-global: indexes registered in a DuckDB process stay registered
   until the process exits, and there is no `tantivy_drop_index` — to replace
   an index, rebuild it under a different name or in a fresh process. On-disk
