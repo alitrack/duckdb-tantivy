@@ -6,8 +6,9 @@
 // RAM index per call; this layer plumbs SQL inputs into it and returns
 // vectors/hits back to DuckDB.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use libduckdb_sys::{duckdb_data_chunk_get_size, duckdb_vector_size};
 use quack_rs::connection::{Connection, Registrar};
@@ -163,6 +164,47 @@ fn session() -> Result<SessionConn, SessionError> {
 #[cfg(test)]
 fn reentry_marked() -> bool {
     IN_QUERY.with(|c| c.get())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Process-global registry of persistent indexes (v0.3)
+//
+// `tantivy_create_index` / `tantivy_load_index` register a
+// `search::PersistentIndex` here by name; `tantivy_search_index` /
+// `tantivy_list` / `tantivy_save_index` read it. The registry is a
+// process-global `OnceLock<Mutex<..>>` (the duckdb-vss pattern): it outlives
+// any single database, and every access is a short-lived lock.
+//
+// Lock discipline (deadlock-free by construction):
+//   * the registry lock is held only long enough to clone/insert/collect
+//     `Arc`s — never across a search, a build, or a file copy;
+//   * the global lock order is session → build → registry. The search/list/
+//     save/load paths take ONLY the registry lock (never the session lock),
+//     so no lock cycle can form;
+//   * `CREATE_INDEX_LOCK` serializes index builds (wipe + write + register)
+//     so two concurrent builds of the same name cannot interleave in the
+//     index directory.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The one process-global registry of persistent indexes, keyed by name.
+static REGISTRY:
+    OnceLock<Mutex<HashMap<String, Arc<search::PersistentIndex>>>> = OnceLock::new();
+
+/// Serializes index builds (see the section note above).
+static CREATE_INDEX_LOCK: Mutex<()> = Mutex::new(());
+
+/// Borrow the registry (initializing it on first use).
+fn registry() -> &'static Mutex<HashMap<String, Arc<search::PersistentIndex>>> {
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lock the registry, recovering from a poisoned lock: one panicking callback
+/// must not brick the registry for the rest of the process.
+fn registry_lock() -> MutexGuard<'static, HashMap<String, Arc<search::PersistentIndex>>> {
+    match registry().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// A conservative identifier check: `[A-Za-z_][A-Za-z0-9_]*`, optionally
@@ -507,6 +549,440 @@ quack_rs::table_scan_callback!(bm25_scan, |info, output| {
         }
         state.next += batch;
         unsafe { chunk.set_size(batch) };
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table function: tantivy_create_index(name, table,
+//   [id_column := ''], [text_column := 'body'], [language := 'english'],
+//   [path := ''])
+//   → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+//
+// Builds the persistent (on-disk, mmap-backed) index `name` from the rows of
+// `table` and registers it in the process-global registry. Corpus acquisition
+// follows the SAME rules as `bm25_search`: dedicated session connection (with
+// the re-entry mark), the MAX_DOCS / text-byte pre-checks before any
+// materialization, safe-identifier validation, NULL rows skipped. The index
+// is stored under `path` (default: `$TANTIVY_INDEX_DIR/<name>`, else
+// `.tantivy_index/<name>` in the current working directory); the directory is
+// caller-owned and wiped before each build (rebuild semantics, like CREATE OR
+// REPLACE — never a silent append). Rebuilding an already-registered name
+// replaces its registry entry.
+//
+// bind  : validate name/table/columns/language; probe table on the session
+//         connection so a missing table/column fails before any I/O.
+// init  : stream the table into documents, build the on-disk index (under
+//         CREATE_INDEX_LOCK), register it in the registry.
+// scan  : emit the one summary row.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct CreateBind {
+    name: String,
+    table: String,
+    id_column: String,
+    text_column: String,
+    language: String,
+    path: String,
+}
+
+struct CreateState {
+    name: String,
+    path: String,
+    docs: i64,
+    language: String,
+    /// Single-row table: emit once, then report done (DuckDB may call the
+    /// scan repeatedly until a zero-sized chunk).
+    done: bool,
+}
+
+quack_rs::table_bind_callback!(create_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info.get_parameter_value(0).as_str().unwrap_or_default();
+        let table = bind_info.get_parameter_value(1).as_str().unwrap_or_default();
+        let id_column = bind_info
+            .get_named_parameter_value("id_column")
+            .as_str()
+            .unwrap_or_default();
+        let text_column = match bind_info.get_named_parameter_value("text_column").as_str() {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => "body".to_string(),
+        };
+        let language = match bind_info.get_named_parameter_value("language").as_str() {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => "english".to_string(),
+        };
+        let path = match bind_info.get_named_parameter_value("path").as_str() {
+            Ok(s) if !s.trim().is_empty() => s.to_string(),
+            _ => String::new(),
+        };
+
+        if !search::is_safe_index_name(&name) {
+            bind_info.set_error(
+                "tantivy_create_index: name must be a single identifier segment like 'my_index' or 'my-index'",
+            );
+            return;
+        }
+        if !is_safe_identifier(&table) {
+            bind_info.set_error(
+                "tantivy_create_index: table must be an identifier like 'docs' or 'main.docs'",
+            );
+            return;
+        }
+        let id_column = id_column.trim().to_string();
+        if !id_column.is_empty() && !is_safe_identifier(&id_column) {
+            bind_info.set_error(
+                "tantivy_create_index: id_column must be an identifier (e.g. 'doc_id') or empty for auto ids",
+            );
+            return;
+        }
+        let text_column = text_column.trim().to_string();
+        if !is_safe_identifier(&text_column) {
+            bind_info
+                .set_error("tantivy_create_index: text_column must be an identifier (e.g. 'body')");
+            return;
+        }
+
+        // Probe table + columns on the session connection (fail early and
+        // name the problem) — the same probe shape as bm25_search.
+        let probe = if id_column.is_empty() {
+            format!("SELECT {text_column}::VARCHAR FROM {table} LIMIT 0")
+        } else {
+            format!(
+                "SELECT {id_column}::BIGINT, {text_column}::VARCHAR FROM {table} LIMIT 0"
+            )
+        };
+        match session() {
+            Ok(sess) => match sess.con.query(&probe) {
+                Ok(_result) => {}
+                Err(e) => {
+                    bind_info
+                        .set_error(&format!("tantivy_create_index: cannot open table '{table}': {e}"));
+                    return;
+                }
+            },
+            Err(e) => {
+                bind_info.set_error(e.message());
+                return;
+            }
+        }
+
+        bind_info
+            .add_result_column("name", TypeId::Varchar)
+            .add_result_column("path", TypeId::Varchar)
+            .add_result_column("docs", TypeId::BigInt)
+            .add_result_column("language", TypeId::Varchar)
+            .set_cardinality(1, true);
+        FfiBindData::<CreateBind>::set(
+            info,
+            CreateBind {
+                name: name.trim().to_string(),
+                table: table.trim().to_string(),
+                id_column,
+                text_column,
+                language,
+                path,
+            },
+        );
+    }
+});
+
+quack_rs::table_init_callback!(create_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+
+        let Some(bind) = FfiBindData::<CreateBind>::get_from_init(info) else {
+            FfiInitData::<CreateState>::set(
+                info,
+                CreateState {
+                    name: String::new(),
+                    path: String::new(),
+                    docs: 0,
+                    language: String::new(),
+                    done: true,
+                },
+            );
+            return;
+        };
+
+        let has_id = !bind.id_column.is_empty();
+        let sql = if has_id {
+            format!(
+                "SELECT {}::BIGINT AS id, {}::VARCHAR AS text FROM {}",
+                bind.id_column, bind.text_column, bind.table
+            )
+        } else {
+            format!("SELECT {}::VARCHAR AS text FROM {}", bind.text_column, bind.table)
+        };
+
+        let mut docs: Vec<search::Document> = Vec::new();
+        let mut seq: i64 = 0;
+        {
+            let sess = match session() {
+                Ok(s) => s,
+                Err(e) => {
+                    init_info.set_error(e.message());
+                    FfiInitData::<CreateState>::set(
+                        info,
+                        CreateState {
+                            name: String::new(),
+                            path: String::new(),
+                            docs: 0,
+                            language: String::new(),
+                            done: true,
+                        },
+                    );
+                    return;
+                }
+            };
+            // Same cheap pre-check as bm25_search: measure the corpus (rows +
+            // text bytes) before copying a single row, so an oversized table
+            // is rejected before the multi-GB allocation.
+            let probe_sql = format!(
+                "SELECT count(*)::BIGINT, COALESCE(sum(LENGTH({text})::BIGINT), 0)::BIGINT \
+                 FROM {table}",
+                text = bind.text_column,
+                table = bind.table,
+            );
+            let mut p = match sess.con.query(&probe_sql) {
+                Ok(r) => r,
+                Err(e) => {
+                    init_info.set_error(&format!("tantivy_create_index: {e}"));
+                    FfiInitData::<CreateState>::set(
+                        info,
+                        CreateState {
+                            name: String::new(),
+                            path: String::new(),
+                            docs: 0,
+                            language: String::new(),
+                            done: true,
+                        },
+                    );
+                    return;
+                }
+            };
+            let chunk = match p.next_chunk() {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    init_info.set_error("tantivy_create_index: pre-check returned no rows");
+                    FfiInitData::<CreateState>::set(
+                        info,
+                        CreateState {
+                            name: String::new(),
+                            path: String::new(),
+                            docs: 0,
+                            language: String::new(),
+                            done: true,
+                        },
+                    );
+                    return;
+                }
+                Err(e) => {
+                    init_info.set_error(&format!("tantivy_create_index: {e}"));
+                    FfiInitData::<CreateState>::set(
+                        info,
+                        CreateState {
+                            name: String::new(),
+                            path: String::new(),
+                            docs: 0,
+                            language: String::new(),
+                            done: true,
+                        },
+                    );
+                    return;
+                }
+            };
+            let r = unsafe { chunk.reader(0) };
+            let c = unsafe { chunk.reader(1) };
+            let row_count = unsafe { r.read_i64(0) } as u64;
+            let text_len = unsafe { c.read_i64(0) } as u64;
+            let text_cap = (search::MAX_DOCS * 1024) as u64; // ~1KB/doc worst case
+            if row_count > search::MAX_DOCS as u64 {
+                init_info.set_error(&format!(
+                    "tantivy_create_index: table '{table}' has {n} rows; the limit is {d} rows — narrow the corpus with a WHERE clause or a filtered view",
+                    table = bind.table,
+                    n = row_count,
+                    d = search::MAX_DOCS
+                ));
+                FfiInitData::<CreateState>::set(
+                    info,
+                    CreateState {
+                        name: String::new(),
+                        path: String::new(),
+                        docs: 0,
+                        language: String::new(),
+                        done: true,
+                    },
+                );
+                return;
+            }
+            if text_len > text_cap {
+                init_info.set_error(&format!(
+                    "tantivy_create_index: table '{table}' holds {t} bytes of text across {n} rows; the limit is {cap} bytes — narrow the corpus",
+                    table = bind.table,
+                    t = text_len,
+                    n = row_count,
+                    cap = text_cap
+                ));
+                FfiInitData::<CreateState>::set(
+                    info,
+                    CreateState {
+                        name: String::new(),
+                        path: String::new(),
+                        docs: 0,
+                        language: String::new(),
+                        done: true,
+                    },
+                );
+                return;
+            }
+            let mut result = match sess.con.query(&sql) {
+                Ok(r) => r,
+                Err(e) => {
+                    init_info.set_error(&format!("tantivy_create_index: {e}"));
+                    FfiInitData::<CreateState>::set(
+                        info,
+                        CreateState {
+                            name: String::new(),
+                            path: String::new(),
+                            docs: 0,
+                            language: String::new(),
+                            done: true,
+                        },
+                    );
+                    return;
+                }
+            };
+            loop {
+                match result.next_chunk() {
+                    Ok(Some(chunk)) => {
+                        let d: &DataChunk = &chunk;
+                        let text_reader = unsafe { d.reader(if has_id { 1 } else { 0 }) };
+                        let id_reader = has_id.then(|| unsafe { d.reader(0) });
+                        for row in 0..d.size() {
+                            if !unsafe { text_reader.is_valid(row) } {
+                                continue; // NULL/missing text → nothing to index
+                            }
+                            let text = unsafe { text_reader.read_str(row) }.to_string();
+                            if text.len() > search::MAX_TEXT_BYTES {
+                                init_info.set_error(&format!(
+                                    "tantivy_create_index: a row in '{table}' exceeds the {b}-byte per-text limit",
+                                    table = bind.table,
+                                    b = search::MAX_TEXT_BYTES
+                                ));
+                                FfiInitData::<CreateState>::set(
+                                    info,
+                                    CreateState {
+                                        name: String::new(),
+                                        path: String::new(),
+                                        docs: 0,
+                                        language: String::new(),
+                                        done: true,
+                                    },
+                                );
+                                return;
+                            }
+                            let id = match &id_reader {
+                                Some(r) => {
+                                    if !unsafe { r.is_valid(row) } {
+                                        continue;
+                                    }
+                                    unsafe { r.read_i64(row) }
+                                }
+                                None => {
+                                    let id = seq;
+                                    seq += 1;
+                                    id
+                                }
+                            };
+                            docs.push(search::Document { id, text });
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        init_info.set_error(&format!("tantivy_create_index: {e}"));
+                        FfiInitData::<CreateState>::set(
+                            info,
+                            CreateState {
+                                name: String::new(),
+                                path: String::new(),
+                                docs: 0,
+                                language: String::new(),
+                                done: true,
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+            // `result`, `p`, and `sess` (session lock + re-entry mark) drop
+            // here, before the lock-free build below.
+        }
+
+        let dir = if bind.path.trim().is_empty() {
+            search::persistent_index_dir(&bind.name)
+        } else {
+            std::path::PathBuf::from(bind.path.trim())
+        };
+        // Serialize builds: a concurrent create/load of the same name must
+        // not interleave wipe/write in the index directory.
+        let _build_guard =
+            CREATE_INDEX_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let idx = match search::create_persistent(&bind.name, &dir, &bind.language, &docs) {
+            Ok(i) => i,
+            Err(e) => {
+                init_info.set_error(&format!("tantivy_create_index: {e}"));
+                FfiInitData::<CreateState>::set(
+                    info,
+                    CreateState {
+                        name: String::new(),
+                        path: String::new(),
+                        docs: 0,
+                        language: String::new(),
+                        done: true,
+                    },
+                );
+                return;
+            }
+        };
+        let out = CreateState {
+            name: idx.name.clone(),
+            path: idx.path.clone(),
+            docs: idx.num_docs as i64,
+            language: idx.language.clone(),
+            done: false,
+        };
+        // Register: a rebuild replaces any previous entry under this name.
+        registry_lock().insert(out.name.clone(), Arc::new(idx));
+
+        FfiInitData::<CreateState>::set(info, out);
+    }
+});
+
+quack_rs::table_scan_callback!(create_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<CreateState>::get_mut(info) else {
+            unsafe { chunk.set_size(0) };
+            return;
+        };
+        if state.done {
+            unsafe { chunk.set_size(0) };
+            return;
+        }
+        let mut name_writer = unsafe { chunk.writer(0) };
+        let mut path_writer = unsafe { chunk.writer(1) };
+        let mut docs_writer = unsafe { chunk.writer(2) };
+        let mut lang_writer = unsafe { chunk.writer(3) };
+        unsafe {
+            name_writer.write_varchar(0, &state.name);
+            path_writer.write_varchar(0, &state.path);
+            docs_writer.write_i64(0, state.docs);
+            lang_writer.write_varchar(0, &state.language);
+        }
+        state.done = true;
+        unsafe { chunk.set_size(1) };
     }
 });
 
@@ -1065,6 +1541,24 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .bind(bm25_bind)
             .init(bm25_init)
             .scan(bm25_scan),
+    )?;
+
+    // tantivy_create_index(name, table, [id_column := ''], [text_column := 'body'],
+    //                      [language := 'english'], [path := ''])
+    //   → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+    // Builds the persistent on-disk index and registers it (see the section
+    // note above the callbacks).
+    con.register_table(
+        TableFunctionBuilder::new("tantivy_create_index")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .named_param("id_column", TypeId::Varchar)
+            .named_param("text_column", TypeId::Varchar)
+            .named_param("language", TypeId::Varchar)
+            .named_param("path", TypeId::Varchar)
+            .bind(create_bind)
+            .init(create_init)
+            .scan(create_scan),
     )?;
 
     con.register_table(
