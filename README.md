@@ -13,9 +13,9 @@ JSON shims: table functions bind to real tables and stream real columns.
 |---|---|
 | `bm25_search(table, query, [id_column := ''], [text_column := 'body'], [language := 'english'], [top_k := 100])` | BM25 search over a table → `doc_id BIGINT, score DOUBLE` |
 | `tantivy_terms(table, [text_column := 'body'])` | Raw-term (unstemmed, lowercased) dictionary of the table → `term VARCHAR, df BIGINT`. Document-frequency per term; the correction-space dictionary for typo-tolerance macro layers. |
-| `supported_languages()` | The 18 Snowball languages tantivy can stem |
-| `tokenize(text)` / `tokenize(text, language)` | Tokenize (+ stem if language given) → `VARCHAR[]` |
-| `stem(word, language)` | Snowball-stem a single word |
+| `supported_languages()` | The 18 Snowball languages tantivy can stem, plus `chinese (jieba)` |
+| `tokenize(text)` / `tokenize(text, language)` | Tokenize (+ stem if language given) → `VARCHAR[]`. `language := 'chinese'` (alias `zh`) uses jieba word segmentation instead of Snowball |
+| `stem(word, language)` | Snowball-stem a single word (`chinese`/`zh`: no stemmer, returns the lowercased word) |
 | `bm25_score(doc, query)` / `bm25_score(doc, query, language)` | BM25 score of one doc against a query |
 | `tantivy_version()` | Version string of the embedded tantivy |
 
@@ -41,6 +41,39 @@ SELECT tokenize('Running quickly','english');-- [run, quick]
 SELECT stem('cats','english');               -- cat
 SELECT bm25_score('the cat sat','cat');      -- 0.28...
 ```
+
+## Chinese tokenization (jieba)
+
+`language := 'chinese'` (aliases `zh`, `中文`; case-insensitive) routes
+indexing and queries through **jieba** word segmentation instead of the
+Snowball stemmer — there are no Chinese word stems, so the pipeline is
+*segment + lowercase only*. Mixed Chinese/English text works: Han runs are
+segmented into words, Latin/digit runs pass through lowercased (`iPhone` →
+`iphone`), and the normal conjunctive (AND) query semantics apply to the
+segmented terms.
+
+```sql
+CREATE TABLE zh_docs(doc_id BIGINT, body VARCHAR);
+INSERT INTO zh_docs VALUES
+  (0, '苹果发布了新款手机'),
+  (4, '苹果 苹果 股票 苹果');
+
+SELECT * FROM bm25_search('zh_docs', '苹果', language := 'chinese');
+-- doc_id | score
+--      4 | ...   -- 3 occurrences rank above doc 0's single occurrence
+
+SELECT tokenize('浙江大学邱建 crater 星系团', 'chinese');
+-- [浙江大学, 邱建, crater, 星系团]   (jieba words, not per-character)
+
+SELECT bm25_score('苹果发布了新款手机', '苹果', 'chinese');  -- > 0
+SELECT language := 'zh'  -- alias, identical behaviour to 'chinese'
+```
+
+`supported_languages()` lists it as `chinese (jieba)`. Note that
+`tantivy_terms` is language-agnostic (it uses the non-stemming default
+analyzer), so for CJK it surfaces whole contiguous Han runs as surface terms —
+use `bm25_search`/`tokenize` with `language := 'chinese'` when you need
+word-level Chinese terms.
 
 ## Hard limits (by design — they become clean SQL errors, never crashes or silent data loss)
 

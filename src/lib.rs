@@ -511,7 +511,8 @@ quack_rs::table_scan_callback!(bm25_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Table function: supported_languages() → lang VARCHAR (18 rows)
+// Table function: supported_languages() → lang VARCHAR
+// (19 rows: 18 Snowball languages + `chinese (jieba)`, see language_display)
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LangState {
@@ -549,7 +550,7 @@ quack_rs::table_scan_callback!(langs_scan, |info, output| {
         let batch = (langs.len() - state.next).min(duckdb_vector_size() as usize);
         let mut writer = unsafe { chunk.writer(0) };
         for i in 0..batch {
-            unsafe { writer.write_varchar(i, langs[state.next + i]) };
+            unsafe { writer.write_varchar(i, search::language_display(langs[state.next + i])) };
         }
         state.next += batch;
         unsafe { chunk.set_size(batch) }

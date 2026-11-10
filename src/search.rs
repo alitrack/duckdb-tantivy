@@ -21,13 +21,15 @@
 //! than panicking. The extension never panics on caller input.
 
 use std::fmt;
+use std::sync::Arc;
 
+use jieba_rs::Jieba;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED};
 use tantivy::tokenizer::{
     Language as TvLanguage, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
-    Token, TokenStream,
+    Token, TokenStream, Tokenizer,
 };
 use tantivy::{doc, Index, TantivyDocument};
 use unicode_normalization::UnicodeNormalization;
@@ -93,10 +95,12 @@ impl std::error::Error for SearchError {}
 
 type Result<T> = std::result::Result<T, SearchError>;
 
-/// The canonical Snowball/stemmer language identifiers tantivy supports, in a
-/// stable order. Drives `supported_languages()` and the README table.
+/// The canonical supported language identifiers, in a stable order. Drives
+/// `supported_languages()` and the README table. The 18 Snowball stemmer
+/// languages plus `chinese` (jieba — no stemmer, see [`Lang::Chinese`]).
 pub const SUPPORTED_LANGUAGES: &[&str] = &[
     "arabic",
+    "chinese",
     "danish",
     "dutch",
     "english",
@@ -116,32 +120,55 @@ pub const SUPPORTED_LANGUAGES: &[&str] = &[
     "turkish",
 ];
 
-/// Resolve a (case-insensitive) language id to a tantivy [`TvLanguage`].
+/// A resolved search language. Snowball languages carry a tantivy stemmer;
+/// Chinese is a tokenization-only language (jieba word segmentation +
+/// lowercase, no stemmer — Chinese has no word stems).
+#[derive(Debug, Clone, Copy)]
+pub enum Lang {
+    Snowball(TvLanguage),
+    Chinese,
+}
+
+/// Resolve a (case-insensitive) language id to a [`Lang`].
 /// `None`/empty selects English by convention; unknown ids are an error.
-fn resolve_language(name: &str) -> Result<TvLanguage> {
+fn resolve_language(name: &str) -> Result<Lang> {
     let n = name.trim().to_ascii_lowercase();
     let lang = match n.as_str() {
-        "arabic" | "ar" => TvLanguage::Arabic,
-        "danish" | "da" => TvLanguage::Danish,
-        "dutch" | "nl" => TvLanguage::Dutch,
-        "english" | "en" => TvLanguage::English,
-        "finnish" | "fi" => TvLanguage::Finnish,
-        "french" | "fr" => TvLanguage::French,
-        "german" | "de" => TvLanguage::German,
-        "greek" | "el" => TvLanguage::Greek,
-        "hungarian" | "hu" => TvLanguage::Hungarian,
-        "italian" | "it" => TvLanguage::Italian,
-        "norwegian" | "no" | "nb" => TvLanguage::Norwegian,
-        "portuguese" | "pt" => TvLanguage::Portuguese,
-        "romanian" | "ro" => TvLanguage::Romanian,
-        "russian" | "ru" => TvLanguage::Russian,
-        "spanish" | "es" => TvLanguage::Spanish,
-        "swedish" | "sv" => TvLanguage::Swedish,
-        "tamil" | "ta" => TvLanguage::Tamil,
-        "turkish" | "tr" => TvLanguage::Turkish,
+        "arabic" | "ar" => Lang::Snowball(TvLanguage::Arabic),
+        "danish" | "da" => Lang::Snowball(TvLanguage::Danish),
+        "dutch" | "nl" => Lang::Snowball(TvLanguage::Dutch),
+        "english" | "en" => Lang::Snowball(TvLanguage::English),
+        "finnish" | "fi" => Lang::Snowball(TvLanguage::Finnish),
+        "french" | "fr" => Lang::Snowball(TvLanguage::French),
+        "german" | "de" => Lang::Snowball(TvLanguage::German),
+        "greek" | "el" => Lang::Snowball(TvLanguage::Greek),
+        "hungarian" | "hu" => Lang::Snowball(TvLanguage::Hungarian),
+        "italian" | "it" => Lang::Snowball(TvLanguage::Italian),
+        "norwegian" | "no" | "nb" => Lang::Snowball(TvLanguage::Norwegian),
+        "portuguese" | "pt" => Lang::Snowball(TvLanguage::Portuguese),
+        "romanian" | "ro" => Lang::Snowball(TvLanguage::Romanian),
+        "russian" | "ru" => Lang::Snowball(TvLanguage::Russian),
+        "spanish" | "es" => Lang::Snowball(TvLanguage::Spanish),
+        "swedish" | "sv" => Lang::Snowball(TvLanguage::Swedish),
+        "tamil" | "ta" => Lang::Snowball(TvLanguage::Tamil),
+        "turkish" | "tr" => Lang::Snowball(TvLanguage::Turkish),
+        // Chinese: no Snowball stemmer exists for it; jieba segments words and
+        // the LowerCaser filter handles the Latin parts of mixed text.
+        "chinese" | "zh" | "\u{4e2d}\u{6587}" => Lang::Chinese,
         _ => return Err(SearchError::UnknownLanguage(name.to_string())),
     };
     Ok(lang)
+}
+
+/// The `lang` column value `supported_languages()` reports for each language:
+/// plain id for Snowball languages, annotated with the segmentation engine
+/// for tokenization-only languages (e.g. `chinese (jieba)`).
+pub fn language_display(lang: &str) -> &str {
+    if lang == "chinese" {
+        "chinese (jieba)"
+    } else {
+        lang
+    }
 }
 
 /// Build the default analyzer: a simple unicode-word tokenizer, lowercased, with
@@ -161,6 +188,109 @@ fn stem_analyzer(lang: TvLanguage) -> TextAnalyzer {
         .filter(LowerCaser)
         .filter(Stemmer::new(lang))
         .build()
+}
+
+/// A tantivy [`Tokenizer`] backed by jieba-rs: Chinese word segmentation with
+/// the HMM path for out-of-dictionary words. The dictionary is embedded in the
+/// crate (no file IO) and loaded once; the [`Jieba`] instance is shared behind
+/// an `Arc` across clones so every analyzer instance reuses it. `cut` returns
+/// borrows of the input, so tokens are copied into owned `String`s here and
+/// whitespace/punctuation-only tokens are dropped (jieba passes them through).
+struct JiebaTokenizer {
+    jieba: Arc<Jieba>,
+}
+
+impl Clone for JiebaTokenizer {
+    fn clone(&self) -> Self {
+        JiebaTokenizer {
+            jieba: Arc::clone(&self.jieba),
+        }
+    }
+}
+
+impl JiebaTokenizer {
+    fn new() -> Self {
+        JiebaTokenizer {
+            jieba: Arc::new(Jieba::new()),
+        }
+    }
+}
+
+struct JiebaTokenStream {
+    words: std::vec::IntoIter<String>,
+    position: usize,
+    token: Token,
+}
+
+impl Tokenizer for JiebaTokenizer {
+    type TokenStream<'a> = JiebaTokenStream;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        let words: Vec<String> = self
+            .jieba
+            .cut(text, true)
+            .into_iter()
+            // Keep tokens carrying at least one alphanumeric character; drops
+            // the whitespace/punctuation fragments jieba emits between words.
+            .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
+            .map(|w| w.to_string())
+            .collect();
+        JiebaTokenStream {
+            words: words.into_iter(),
+            position: 0,
+            token: Token {
+                offset_from: 0,
+                offset_to: 0,
+                position: 0,
+                text: String::new(),
+                position_length: 1,
+            },
+        }
+    }
+}
+
+impl TokenStream for JiebaTokenStream {
+    fn advance(&mut self) -> bool {
+        self.token.reset();
+        let Some(word) = self.words.next() else {
+            return false;
+        };
+        // Offsets track the kept-token sequence (jieba's dropped fragments
+        // between words are not counted); they stay monotonic, which is all
+        // tantivy requires — position data is what conjunction queries use.
+        self.token.offset_from = self.token.offset_to;
+        self.token.offset_to += word.len();
+        self.token.position = self.position;
+        self.token.position_length = 1;
+        self.position += 1;
+        self.token.text = word;
+        true
+    }
+    fn token(&self) -> &Token {
+        &self.token
+    }
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.token
+    }
+}
+
+/// Build the Chinese analyzer: jieba word segmentation, drop over-long tokens,
+/// lowercase (harmless for Han characters, lowercases the Latin/digit parts of
+/// mixed text). No stemmer — Chinese has no word stems.
+fn chinese_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(JiebaTokenizer::new())
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .build()
+}
+
+/// The analyzer pipeline for a resolved [`Lang`]: Snowball stemmer for the 18
+/// stemming languages, jieba segmentation for Chinese.
+fn analyzer_for(lang: &Lang) -> TextAnalyzer {
+    match lang {
+        Lang::Snowball(l) => stem_analyzer(*l),
+        Lang::Chinese => chinese_analyzer(),
+    }
 }
 
 /// Collect the tokens produced by an analyzer over `text`. The text is
@@ -187,16 +317,18 @@ pub fn tokenize_default(text: &str) -> Result<Vec<String>> {
 pub fn tokenize_lang(text: &str, lang: &str) -> Result<Vec<String>> {
     check_text_len(text)?;
     let l = resolve_language(lang)?;
-    Ok(run_analyzer(stem_analyzer(l), text))
+    Ok(run_analyzer(analyzer_for(&l), text))
 }
 
-/// Snowball-stem a single `word` for `lang` (the whole input is treated as one
-/// token, lowercased then stemmed). Empty word → empty string; unknown language
-/// → error. E.g. `stem("running", "english") == "run"`.
+/// Reduce a single `word` for `lang`: Snowball-stemmed for the 18 stemmer
+/// languages, jieba-segmented (no stem) for `chinese`. The whole input is
+/// treated as one token run, lowercased then stemmed/segmented. Empty word →
+/// empty string; unknown language → error. E.g. `stem("running","english") ==
+/// "run"`; for Chinese the word comes back lowercased as-is.
 pub fn stem(word: &str, lang: &str) -> Result<String> {
     check_text_len(word)?;
     let l = resolve_language(lang)?;
-    let toks = run_analyzer(stem_analyzer(l), word);
+    let toks = run_analyzer(analyzer_for(&l), word);
     // A lone word yields a single token; join defensively if the tokenizer split.
     Ok(toks.join(" "))
 }
@@ -307,8 +439,7 @@ pub fn parse_docs(docs_json: &str) -> Result<Vec<Document>> {
 /// and the extra work is bounded by the corpus size we already indexed.
 pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> Result<Vec<Hit>> {
     check_text_len(query)?;
-    let l = resolve_language(lang)?;
-    if docs.is_empty() || query.trim().is_empty() {
+    let l = resolve_language(lang)?;    if docs.is_empty() || query.trim().is_empty() {
         return Ok(Vec::new());
     }
 
@@ -324,7 +455,7 @@ pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> 
     let schema = sb.build();
 
     let index = Index::create_in_ram(schema);
-    index.tokenizers().register(ANALYZER, stem_analyzer(l));
+    index.tokenizers().register(ANALYZER, analyzer_for(&l));
 
     let mut writer = index
         .writer(WRITER_HEAP_BYTES)
@@ -698,7 +829,7 @@ mod tests {
     #[test]
     fn supported_languages_includes_english() {
         assert!(SUPPORTED_LANGUAGES.contains(&"english"));
-        assert_eq!(SUPPORTED_LANGUAGES.len(), 18);
+        assert_eq!(SUPPORTED_LANGUAGES.len(), 19);
         for l in SUPPORTED_LANGUAGES {
             assert!(resolve_language(l).is_ok(), "{l} must resolve");
         }
@@ -751,5 +882,67 @@ mod tests {
             tokenize_default("caf\u{00E9}"),
             tokenize_default("caf\u{0065}\u{0301}")
         );
+    }
+
+    #[test]
+    fn resolve_language_chinese_aliases() {
+        assert!(matches!(resolve_language("chinese").unwrap(), Lang::Chinese));
+        assert!(matches!(resolve_language("ZH").unwrap(), Lang::Chinese));
+        assert!(matches!(resolve_language("  中文 ").unwrap(), Lang::Chinese));
+        assert!(matches!(
+            resolve_language("english").unwrap(),
+            Lang::Snowball(TvLanguage::English)
+        ));
+    }
+
+    #[test]
+    fn tokenize_chinese_segments_words_not_chars() {
+        let toks = tokenize_lang("浙江大学邱建 crater 星系团", "chinese").unwrap();
+        assert!(
+            toks.iter().any(|t| t == "浙江大学"),
+            "full word 浙江大学 expected, got: {toks:?}"
+        );
+        assert!(
+            toks.iter().any(|t| t == "crater"),
+            "latin word must survive, got: {toks:?}"
+        );
+        // Whitespace/punctuation-only fragments must not appear.
+        assert!(
+            toks.iter().all(|t| t.chars().any(|c| c.is_alphanumeric())),
+            "no punctuation/whitespace tokens, got: {toks:?}"
+        );
+    }
+
+    #[test]
+    fn stem_chinese_is_identity_lowercased() {
+        // No stemmer for Chinese: a word comes back as-is (lowercased latin).
+        assert_eq!(stem("苹果", "chinese").unwrap(), "苹果");
+        assert_eq!(stem("iPhone", "chinese").unwrap(), "iphone");
+    }
+
+    #[test]
+    fn bm25_search_chinese_corpus() {
+        let docs = vec![
+            Document { id: 0, text: "苹果发布了新款手机".into() },
+            Document { id: 1, text: "华为的麒麟芯片很强大".into() },
+            Document { id: 2, text: "北京大学的计算机系招生".into() },
+            Document { id: 3, text: "今天天气很好适合出门运动".into() },
+            Document { id: 4, text: "苹果 苹果 股票 苹果".into() },
+        ];
+        let hits = bm25_search(&docs, "苹果", "chinese", 10).unwrap();
+        let ids: Vec<i64> = hits.iter().map(|h| h.doc_id).collect();
+        assert_eq!(ids, vec![4, 0], "doc 4 (3x 苹果) first, then doc 0; got {ids:?}");
+        // Conjunction (AND): no doc contains both 苹果 and 华为.
+        let conj = bm25_search(&docs, "苹果 华为", "chinese", 10).unwrap();
+        assert!(conj.is_empty(), "AND semantics must yield no hits");
+        // Absent word → no hits.
+        assert!(bm25_search(&docs, "企鹅", "chinese", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn supported_languages_marks_chinese_jieba() {
+        assert!(SUPPORTED_LANGUAGES.contains(&"chinese"));
+        assert_eq!(language_display("chinese"), "chinese (jieba)");
+        assert_eq!(language_display("english"), "english");
     }
 }

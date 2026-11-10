@@ -161,12 +161,18 @@ fn bm25_score_relevant_positive_irrelevant_zero() {
 }
 
 #[test]
-fn supported_languages_has_18_rows() {
+fn supported_languages_has_19_rows() {
     let d = db();
+    // 18 Snowball languages + chinese (jieba) — see search::SUPPORTED_LANGUAGES.
     let n: i64 = d
         .query_one("SELECT count(*) FROM supported_languages()")
         .unwrap();
-    assert_eq!(n, 18, "SUPPORTED_LANGUAGES has 18 entries");
+    assert_eq!(n, 19, "SUPPORTED_LANGUAGES has 19 entries");
+    // chinese is annotated with its segmentation engine.
+    let zh: String = d
+        .query_one("SELECT lang FROM supported_languages() WHERE lang = 'chinese (jieba)'")
+        .unwrap();
+    assert_eq!(zh, "chinese (jieba)");
     let has_english: i64 = d
         .query_one("SELECT count(*) FROM supported_languages() WHERE lang='english'")
         .unwrap();
@@ -295,4 +301,164 @@ fn tokenize_overflow_is_error_not_silent_null() {
         msg.contains("exceeds") || msg.contains("tokenize"),
         "clear overflow error: {err}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chinese tokenization (jieba): `chinese`/`zh` language — full SQL chain.
+// The jieba dictionary is embedded in the crate; segmentation is word-level
+// (not per-character), so '浙江大学' is one token, not four.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ZH_CORPUS: &str = r#"
+CREATE OR REPLACE TABLE zh_docs(doc_id BIGINT, body VARCHAR);
+INSERT INTO zh_docs VALUES
+  (0, '苹果发布了新款手机'),
+  (1, '华为的麒麟芯片很强大'),
+  (2, '北京大学的计算机系招生'),
+  (3, '今天天气很好适合出门运动'),
+  (4, '苹果 苹果 股票 苹果');
+"#;
+
+#[test]
+fn tokenize_chinese_returns_jieba_words() {
+    let d = db();
+    // jieba full segmentation must produce the complete word '浙江大学'
+    // (not per-character), and the latin word must survive.
+    let has_univ: i64 = d
+        .query_one("SELECT list_contains(tokenize('浙江大学邱建 crater 星系团', 'chinese'), '浙江大学')::INTEGER")
+        .unwrap();
+    assert_eq!(has_univ, 1, "'浙江大学' must be a jieba token");
+    let has_crater: i64 = d
+        .query_one("SELECT list_contains(tokenize('浙江大学邱建 crater 星系团', 'chinese'), 'crater')::INTEGER")
+        .unwrap();
+    assert_eq!(has_crater, 1, "latin word must survive as a token");
+}
+
+#[test]
+fn bm25_search_chinese_corpus_hits_right_rows() {
+    let d = db();
+    d.execute_batch(ZH_CORPUS).unwrap();
+    // '苹果' occurs in docs 0 (once) and 4 (three times); nobody else.
+    let ids: String = d
+        .query_one("SELECT string_agg(doc_id::VARCHAR, ',' ORDER BY doc_id) FROM bm25_search('zh_docs', '苹果', id_column:='doc_id', language:='chinese')")
+        .unwrap();
+    assert_eq!(ids, "0,4", "only docs 0 and 4 contain 苹果, got {ids}");
+    // top_k=1 must return the highest-scoring doc: doc 4 has 3 occurrences
+    // of the query term vs 1 in doc 0, and a shorter body.
+    let top: i64 = d
+        .query_one("SELECT doc_id FROM bm25_search('zh_docs', '苹果', id_column:='doc_id', language:='chinese', top_k:=1)")
+        .unwrap();
+    assert_eq!(top, 4, "doc 4 (3x 苹果) must outrank doc 0 (1x)");
+    // A word absent from the corpus yields nothing.
+    let none: i64 = d
+        .query_one("SELECT count(*) FROM bm25_search('zh_docs', '企鹅', id_column:='doc_id', language:='chinese')")
+        .unwrap();
+    assert_eq!(none, 0);
+}
+
+#[test]
+fn bm25_search_chinese_conjunction_is_and() {
+    let d = db();
+    d.execute_batch(ZH_CORPUS).unwrap();
+    // Conjunction (AND) semantics: no single doc contains both 苹果 and 华为.
+    let conj: i64 = d
+        .query_one("SELECT count(*) FROM bm25_search('zh_docs', '苹果 华为', id_column:='doc_id', language:='chinese')")
+        .unwrap();
+    assert_eq!(conj, 0, "AND semantics: no doc has both 苹果 and 华为");
+}
+
+#[test]
+fn bm25_search_chinese_mixed_language_rows() {
+    let d = db();
+    d.execute_batch(
+        "CREATE OR REPLACE TABLE zh_mixed(doc_id BIGINT, body VARCHAR); \
+         INSERT INTO zh_mixed VALUES (0, '苹果 iPhone 15 发布'), (1, '华为 Mate 60 上市');",
+    )
+    .unwrap();
+    // Chinese query term hits the right row.
+    let hit_zh: i64 = d
+        .query_one("SELECT doc_id FROM bm25_search('zh_mixed', '发布', id_column:='doc_id', language:='chinese', top_k:=1)")
+        .unwrap();
+    assert_eq!(hit_zh, 0);
+    // Latin word is indexed lowercased by the chinese analyzer.
+    let hit_en: i64 = d
+        .query_one("SELECT doc_id FROM bm25_search('zh_mixed', 'iphone', id_column:='doc_id', language:='chinese', top_k:=1)")
+        .unwrap();
+    assert_eq!(hit_en, 0, "lowercased 'iphone' must match the 'iPhone' row");
+    // tokenize sees both the chinese word and the lowercased latin word.
+    let has_both: i64 = d
+        .query_one("SELECT (list_contains(tokenize('苹果 iPhone 15 发布','chinese'), '苹果') AND list_contains(tokenize('苹果 iPhone 15 发布','chinese'), 'iphone'))::INTEGER")
+        .unwrap();
+    assert_eq!(has_both, 1, "mixed row must yield both 苹果 and iphone");
+}
+
+#[test]
+fn tantivy_terms_chinese_table_returns_chinese_terms() {
+    let d = db();
+    d.execute_batch(ZH_CORPUS).unwrap();
+    // The raw-term dictionary must surface Chinese text as terms. The default
+    // (non-stemming) pipeline keeps a CJK run as one token, so the doc-1
+    // surface form '华为的麒麟芯片很强大' appears; '华为' is a substring of it.
+    let all: String = d
+        .query_one("SELECT string_agg(term, ',' ORDER BY term) FROM tantivy_terms('zh_docs', text_column:='body')")
+        .unwrap();
+    assert!(
+        all.contains("华为"),
+        "expected Chinese terms in the dictionary, got: {all}"
+    );
+    let n: i64 = d
+        .query_one("SELECT count(*) FROM tantivy_terms('zh_docs', text_column:='body')")
+        .unwrap();
+    assert!(n > 0, "dictionary must be non-empty");
+}
+
+#[test]
+fn zh_alias_is_equivalent_to_chinese() {
+    let d = db();
+    d.execute_batch(ZH_CORPUS).unwrap();
+    let via_chinese: String = d
+        .query_one("SELECT string_agg(doc_id::VARCHAR, ',' ORDER BY doc_id) FROM bm25_search('zh_docs', '苹果', id_column:='doc_id', language:='chinese')")
+        .unwrap();
+    let via_zh: String = d
+        .query_one("SELECT string_agg(doc_id::VARCHAR, ',' ORDER BY doc_id) FROM bm25_search('zh_docs', '苹果', id_column:='doc_id', language:='zh')")
+        .unwrap();
+    assert_eq!(via_chinese, via_zh, "'zh' must behave exactly like 'chinese'");
+    assert!(!via_zh.is_empty(), "the alias search must actually match docs");
+    // tokenize agrees for both ids.
+    let same: i64 = d
+        .query_one("SELECT (tokenize('苹果 华为 手机','zh') = tokenize('苹果 华为 手机','chinese'))::INTEGER")
+        .unwrap();
+    assert_eq!(same, 1, "tokenize must be identical for zh and chinese");
+}
+
+#[test]
+fn chinese_language_id_is_case_insensitive() {
+    let d = db();
+    d.execute_batch(ZH_CORPUS).unwrap();
+    for id in ["chinese", "Chinese", "CHINESE", " zh "] {
+        let n: i64 = d
+            .query_one(&format!(
+                "SELECT count(*) FROM bm25_search('zh_docs', '苹果', id_column:='doc_id', language:='{id}')"
+            ))
+            .unwrap_or_else(|e| panic!("language id '{id}' must be accepted: {e}"));
+        assert!(n > 0, "language id '{id}' must match docs");
+    }
+    // tokenize: case variants must give identical output.
+    let same: i64 = d
+        .query_one("SELECT (tokenize('苹果 iPhone 15 发布','CHINESE') = tokenize('苹果 iPhone 15 发布','chinese'))::INTEGER")
+        .unwrap();
+    assert_eq!(same, 1, "CHINESE and chinese must tokenize identically");
+}
+
+#[test]
+fn bm25_score_chinese() {
+    let d = db();
+    let hit: f64 = d
+        .query_one("SELECT bm25_score('苹果发布了新款手机', '苹果', 'chinese')")
+        .unwrap();
+    assert!(hit > 0.0, "matching chinese doc must score > 0, got {hit}");
+    let miss: f64 = d
+        .query_one("SELECT bm25_score('华为的麒麟芯片很强大', '苹果', 'chinese')")
+        .unwrap();
+    assert_eq!(miss, 0.0, "non-matching chinese doc must score 0.0");
 }
