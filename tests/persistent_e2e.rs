@@ -155,6 +155,78 @@ fn fresh_process_load() {
     eprintln!("LOAD phase: 3 CSVs written to {out} (fresh process)");
 }
 
+/// M9 coordinator repro, cross-process: 100k-row CHINESE index (their exact
+/// template) — process A builds + saves, process B loads and searches.
+///
+/// The coordinator's acceptance query is '苹果 股票' top_k 3, but on THIS
+/// corpus every row contains both terms exactly once (identical token count:
+/// each digit run is one jieba token), so all 100k documents tie exactly on
+/// score (idf ≈ 1e-5, strictly positive); the documented (score desc, doc_id
+/// asc) contract therefore returns 0,1,2 — and round(score,3) shows 0.0 for
+/// a ~1e-5 score. The M9 phase pins that full-precision output is
+/// bit-identical across the fresh-process load AND equal to ephemeral
+/// bm25_search, plus discriminative queries ('9699' rare, '96' mid-freq)
+/// that prove correct big-index term matching / stored-id / scoring.
+const M9_CORPUS: &str = r#"
+CREATE OR REPLACE TABLE big(doc_id BIGINT, body VARCHAR);
+INSERT INTO big SELECT i, '文档第 '||i||' 号 苹果 股票 涨跌 '||(i%97)||' 科技公司营收 '||(i%31) FROM range(100000) t(i);
+"#;
+
+#[test]
+#[ignore]
+fn fresh_process_m9_chinese_100k_save() {
+    let out = out_dir();
+    let d = load_db();
+    d.execute_batch(M9_CORPUS).unwrap();
+    let dir = format!("{out}/m9_index");
+    let copy = format!("{out}/m9_index_copy");
+    d.execute_batch(&format!(
+        "SELECT * FROM tantivy_create_index('m9ci','big', id_column:='doc_id', text_column:='body', language:='chinese', path:='{dir}')"
+    )).unwrap();
+    d.execute_batch(&format!("SELECT * FROM tantivy_save_index('m9ci', path:='{copy}')")).unwrap();
+
+    // Persistent (fresh process A) — full precision, unrounded.
+    dump(&d, &out, "m9_p_create",
+        "SELECT doc_id, score FROM tantivy_search_index('m9ci','苹果 股票', top_k:=3) ORDER BY doc_id");
+    dump(&d, &out, "m9_r_create",
+        "SELECT doc_id, score FROM tantivy_search_index('m9ci','9699', top_k:=3) ORDER BY doc_id");
+    dump(&d, &out, "m9_m_create",
+        "SELECT count(*) FROM tantivy_search_index('m9ci','96', top_k:=100000)");
+    // The coordinator's literal acceptance view (rounded).
+    dump(&d, &out, "m9_p_create_rounded",
+        "SELECT doc_id, round(score,3) FROM tantivy_search_index('m9ci','苹果 股票', top_k:=3) ORDER BY doc_id");
+    // Ephemeral ground truth, identical parameters.
+    dump(&d, &out, "m9_p_ephemeral",
+        "SELECT doc_id, score FROM bm25_search('big','苹果 股票', id_column:='doc_id', text_column:='body', language:='chinese', top_k:=3) ORDER BY doc_id");
+    dump(&d, &out, "m9_r_ephemeral",
+        "SELECT doc_id, score FROM bm25_search('big','9699', id_column:='doc_id', text_column:='body', language:='chinese', top_k:=3) ORDER BY doc_id");
+    dump(&d, &out, "m9_m_ephemeral",
+        "SELECT count(*) FROM bm25_search('big','96', id_column:='doc_id', text_column:='body', language:='chinese', top_k:=100000)");
+    eprintln!("M9 SAVE phase: 7 CSVs (fresh process A)");
+}
+
+#[test]
+#[ignore]
+fn fresh_process_m9_chinese_100k_load() {
+    let out = out_dir();
+    let d = load_db();
+    let copy = format!("{out}/m9_index_copy");
+    d.execute_batch(&format!(
+        "SELECT * FROM tantivy_load_index('m9ci_loaded','{copy}')"
+    )).unwrap();
+
+    // Persistent (FRESH process B) — must be bit-identical to process A.
+    dump(&d, &out, "m9_p_load",
+        "SELECT doc_id, score FROM tantivy_search_index('m9ci_loaded','苹果 股票', top_k:=3) ORDER BY doc_id");
+    dump(&d, &out, "m9_r_load",
+        "SELECT doc_id, score FROM tantivy_search_index('m9ci_loaded','9699', top_k:=3) ORDER BY doc_id");
+    dump(&d, &out, "m9_m_load",
+        "SELECT count(*) FROM tantivy_search_index('m9ci_loaded','96', top_k:=100000)");
+    dump(&d, &out, "m9_p_load_rounded",
+        "SELECT doc_id, round(score,3) FROM tantivy_search_index('m9ci_loaded','苹果 股票', top_k:=3) ORDER BY doc_id");
+    eprintln!("M9 LOAD phase: 4 CSVs (fresh process B)");
+}
+
 #[test]
 #[ignore]
 fn fresh_process_perf_100k() {

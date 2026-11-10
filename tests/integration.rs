@@ -858,6 +858,96 @@ fn persistent_list_sorted_and_stable() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// M9 coordinator repro: 100k-row CHINESE corpus (their exact template),
+/// persistent index vs ephemeral bm25_search on the same table + parameters.
+///
+/// Key fact about this corpus: EVERY row contains 苹果 and 股票 exactly once,
+/// and every row has the same token count (each digit run is ONE jieba
+/// token), so all 100k documents carry the SAME BM25 score for the query
+/// '苹果 股票' — a strict tie that our documented contract breaks by
+/// ascending doc_id. The term's idf is ~5e-6 (not zero: df=N, N=100k) because
+/// the term occurs in the whole corpus.
+#[test]
+fn m9_chinese_100k_acceptance_parity() {
+    let d = db();
+    d.execute_batch(
+        "CREATE OR REPLACE TABLE big(doc_id BIGINT, body VARCHAR);
+         INSERT INTO big SELECT i, '文档第 '||i||' 号 苹果 股票 涨跌 '||(i%97)||' 科技公司营收 '||(i%31) FROM range(100000) t(i)",
+    )
+    .unwrap();
+    let dir = persist_dir("m9");
+    d.execute_batch(&format!(
+        "SELECT * FROM tantivy_create_index('m9ci','big', id_column:='doc_id', text_column:='body', language:='chinese', path:='{}')",
+        dir
+    )).unwrap();
+
+    // 1) The coordinator's exact query on BOTH engines, full precision.
+    let p: String = d
+        .query_one(
+            "SELECT COALESCE(string_agg(doc_id::VARCHAR || ':' || score::VARCHAR, ',' ORDER BY doc_id), 'NONE')
+             FROM tantivy_search_index('m9ci','苹果 股票', top_k:=3)",
+        )
+        .unwrap();
+    let e: String = d
+        .query_one(
+            "SELECT COALESCE(string_agg(doc_id::VARCHAR || ':' || score::VARCHAR, ',' ORDER BY doc_id), 'NONE')
+             FROM bm25_search('big','苹果 股票', id_column:='doc_id', text_column:='body', language:='chinese', top_k:=3)",
+        )
+        .unwrap();
+    eprintln!("M9 '苹果 股票' persistent: {p}");
+    eprintln!("M9 '苹果 股票' ephemeral : {e}");
+    assert_eq!(p, e, "persistent must equal ephemeral at 100k-chinese scale");
+    assert!(p != "NONE", "query must match docs");
+
+    // 2) Scores are strictly POSITIVE (round(score,3)=0.0 is a rounding
+    //    artifact of a ~1e-5 score, not a zero score).
+    let smin: f64 = d
+        .query_one("SELECT min(score) FROM tantivy_search_index('m9ci','苹果 股票', top_k:=3)")
+        .unwrap();
+    let semin: f64 = d
+        .query_one("SELECT min(score) FROM bm25_search('big','苹果 股票', id_column:='doc_id', text_column:='body', language:='chinese', top_k:=3)")
+        .unwrap();
+    assert!(smin > 0.0, "matching docs must score > 0, got {smin}");
+    assert_eq!(smin, semin, "scores must match the ephemeral engine exactly");
+
+    // 3) doc_id 0,1,2 is the CORRECT top-3: uniform tf (1x each) + uniform
+    //    doc length (12 tokens) → exact tie across all 100k docs → the
+    //    documented (score desc, doc_id asc) contract picks 0,1,2.
+    assert!(p.starts_with("0:"), "smallest-id tie-break must hold: {p}");
+
+    // 4) Discriminative queries prove correct ranking on the big index:
+    //    a rare digit run ('9699' appears only in doc 9699) must rank that
+    //    doc first with a meaningful score; a mid-frequency run ('96')
+    //    matches ~1/97 of the corpus.
+    let rare_p: String = d
+        .query_one("SELECT doc_id::VARCHAR || ':' || score::VARCHAR FROM tantivy_search_index('m9ci','9699', top_k:=3)")
+        .unwrap();
+    let rare_e: String = d
+        .query_one("SELECT doc_id::VARCHAR || ':' || score::VARCHAR FROM bm25_search('big','9699', id_column:='doc_id', text_column:='body', language:='chinese', top_k:=3)")
+        .unwrap();
+    eprintln!("M9 '9699' persistent: {rare_p}");
+    eprintln!("M9 '9699' ephemeral : {rare_e}");
+    assert_eq!(rare_p, rare_e, "rare-term search must match the ephemeral engine");
+    assert!(
+        rare_p.starts_with("9699:"),
+        "doc 9699 (the only one containing '9699') must rank first: {rare_p}"
+    );
+    let rs: f64 = d
+        .query_one("SELECT score FROM tantivy_search_index('m9ci','9699', top_k:=1)")
+        .unwrap();
+    assert!(rs > 1.0, "rare-term score must be meaningful, got {rs}");
+    let med: i64 = d
+        .query_one("SELECT count(*) FROM tantivy_search_index('m9ci','96', top_k:=100000)")
+        .unwrap();
+    let med_e: i64 = d
+        .query_one("SELECT count(*) FROM bm25_search('big','96', id_column:='doc_id', text_column:='body', language:='chinese', top_k:=100000)")
+        .unwrap();
+    assert_eq!(med, med_e, "mid-frequency hit count must match");
+    assert!(med > 500 && med < 2000, "'96' should match ~1031 docs, got {med}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn persistent_index_100k_rows() {
     let d = db();
