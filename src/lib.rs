@@ -1131,6 +1131,83 @@ quack_rs::table_scan_callback!(psearch_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Table function: tantivy_list()
+//   → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+//
+// A snapshot of the process-global registry of persistent indexes: one row
+// per registered index, sorted by name. The snapshot is taken at init time
+// (the registry lock is held only while copying the fields out), so a
+// concurrent build/load cannot mutate the rows mid-scan.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct ListState {
+    rows: Vec<(String, String, i64, String)>,
+    next: usize,
+}
+
+quack_rs::table_bind_callback!(list_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        bind_info
+            .add_result_column("name", TypeId::Varchar)
+            .add_result_column("path", TypeId::Varchar)
+            .add_result_column("docs", TypeId::BigInt)
+            .add_result_column("language", TypeId::Varchar)
+            .set_cardinality(0, false); // exact size unknown until the snapshot
+    }
+});
+
+quack_rs::table_init_callback!(list_init, |info| {
+    unsafe {
+        InitInfo::new(info).set_max_threads(1);
+        // Snapshot the registry (short lock, plain field copies out).
+        let mut rows: Vec<(String, String, i64, String)> = registry_lock()
+            .iter()
+            .map(|(name, idx)| {
+                (
+                    name.clone(),
+                    idx.path.clone(),
+                    idx.num_docs as i64,
+                    idx.language.clone(),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        FfiInitData::<ListState>::set(info, ListState { rows, next: 0 });
+    }
+});
+
+quack_rs::table_scan_callback!(list_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<ListState>::get_mut(info) else {
+            unsafe { chunk.set_size(0) };
+            return;
+        };
+        if state.next >= state.rows.len() {
+            unsafe { chunk.set_size(0) };
+            return;
+        }
+        let batch = (state.rows.len() - state.next).min(duckdb_vector_size() as usize);
+        let mut name_writer = unsafe { chunk.writer(0) };
+        let mut path_writer = unsafe { chunk.writer(1) };
+        let mut docs_writer = unsafe { chunk.writer(2) };
+        let mut lang_writer = unsafe { chunk.writer(3) };
+        for i in 0..batch {
+            let row = &state.rows[state.next + i];
+            unsafe {
+                name_writer.write_varchar(i, &row.0);
+                path_writer.write_varchar(i, &row.1);
+                docs_writer.write_i64(i, row.2);
+                lang_writer.write_varchar(i, &row.3);
+            }
+        }
+        state.next += batch;
+        unsafe { chunk.set_size(batch) }
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Table function: supported_languages() → lang VARCHAR
 // (19 rows: 18 Snowball languages + `chinese (jieba)`, see language_display)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1408,6 +1485,387 @@ quack_rs::table_scan_callback!(terms_scan, |info, output| {
         }
         state.next += batch;
         unsafe { chunk.set_size(batch) }
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table function: tantivy_save_index(name, [path := ''])
+//   → name VARCHAR, path VARCHAR, docs BIGINT
+//
+// Copies the directory of the registered index `name` to `path`, or (when
+// `path` is omitted) simply reports where the index currently lives. The copy
+// is a full recursive copy of every file in the index directory (including
+// the `__tantivy_meta.json` provenance sidecar), so the destination is a
+// complete, loadable index: `tantivy_load_index` works on it from any other
+// process. Guards: the destination must not be an ancestor/descendant of the
+// source (recursion hazard), and if it exists it must be EMPTY (never a
+// silent overwrite). The running index keeps reading from its original
+// location — save is a backup/transfer primitive, not a move.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// True if `desc` is `anc` itself or nested inside it.
+fn is_ancestor_or_self(anc: &std::path::Path, desc: &std::path::Path) -> bool {
+    if anc == desc {
+        return true;
+    }
+    let mut cur = desc;
+    loop {
+        match cur.parent() {
+            Some(p) if p == anc => return true,
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+}
+
+/// Recursively copy every entry of `src` into `dst` (which must exist and be
+/// empty; nested directories are created as needed).
+fn copy_index_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let e = entry?;
+        let target = dst.join(e.file_name());
+        if e.path().is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_index_dir(&e.path(), &target)?;
+        } else {
+            std::fs::copy(e.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+struct SaveBind {
+    name: String,
+    path: String,
+}
+
+struct SaveState {
+    name: String,
+    path: String,
+    docs: i64,
+    done: bool,
+}
+
+quack_rs::table_bind_callback!(save_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info.get_parameter_value(0).as_str().unwrap_or_default();
+        let path = match bind_info.get_named_parameter_value("path").as_str() {
+            Ok(s) if !s.trim().is_empty() => s.to_string(),
+            _ => String::new(),
+        };
+
+        if !search::is_safe_index_name(&name) {
+            bind_info.set_error(
+                "tantivy_save_index: name must be a single identifier segment like 'my_index' or 'my-index'",
+            );
+            return;
+        }
+        let registered = registry_lock().contains_key(&name);
+        if !registered {
+            bind_info.set_error(&format!(
+                "tantivy_save_index: no persistent index '{name}' is registered; \
+                 create it with tantivy_create_index or tantivy_load_index \
+                 (see tantivy_list() for registered names)"
+            ));
+            return;
+        }
+
+        bind_info
+            .add_result_column("name", TypeId::Varchar)
+            .add_result_column("path", TypeId::Varchar)
+            .add_result_column("docs", TypeId::BigInt)
+            .set_cardinality(1, true);
+        FfiBindData::<SaveBind>::set(info, SaveBind { name: name.trim().to_string(), path });
+    }
+});
+
+quack_rs::table_init_callback!(save_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+
+        let Some(bind) = FfiBindData::<SaveBind>::get_from_init(info) else {
+            FfiInitData::<SaveState>::set(
+                info,
+                SaveState { name: String::new(), path: String::new(), docs: 0, done: true },
+            );
+            return;
+        };
+
+        let idx: Arc<search::PersistentIndex> = match registry_lock().get(&bind.name).cloned() {
+            Some(i) => i,
+            None => {
+                init_info.set_error(&format!(
+                    "tantivy_save_index: no persistent index '{}' is registered",
+                    bind.name
+                ));
+                FfiInitData::<SaveState>::set(
+                    info,
+                    SaveState { name: String::new(), path: String::new(), docs: 0, done: true },
+                );
+                return;
+            }
+        };
+
+        let src = std::path::Path::new(&idx.path);
+        let dst = if bind.path.trim().is_empty() {
+            src.to_path_buf() // no path given: just report where it lives
+        } else {
+            std::path::PathBuf::from(bind.path.trim())
+        };
+
+        if dst != src {
+            // Recursion hazard: never copy a tree into (or onto) itself.
+            if is_ancestor_or_self(&dst, src) || is_ancestor_or_self(src, &dst) {
+                init_info.set_error(&format!(
+                    "tantivy_save_index: destination '{}' must not be inside (or contain) the index directory '{}'",
+                    dst.display(), src.display()
+                ));
+                FfiInitData::<SaveState>::set(
+                    info,
+                    SaveState { name: String::new(), path: String::new(), docs: 0, done: true },
+                );
+                return;
+            }
+            // Never overwrite: an existing destination must be empty.
+            if dst.exists() {
+                let non_empty = match std::fs::read_dir(&dst) {
+                    Ok(mut it) => it.next().is_some(),
+                    Err(e) => {
+                        init_info.set_error(&format!(
+                            "tantivy_save_index: destination '{}' is not a directory: {e}",
+                            dst.display()
+                        ));
+                        FfiInitData::<SaveState>::set(
+                            info,
+                            SaveState { name: String::new(), path: String::new(), docs: 0, done: true },
+                        );
+                        return;
+                    }
+                };
+                if non_empty {
+                    init_info.set_error(&format!(
+                        "tantivy_save_index: destination '{}' exists and is not empty; refusing to overwrite",
+                        dst.display()
+                    ));
+                    FfiInitData::<SaveState>::set(
+                        info,
+                        SaveState { name: String::new(), path: String::new(), docs: 0, done: true },
+                    );
+                    return;
+                }
+            }
+            if let Err(e) = std::fs::create_dir_all(&dst) {
+                init_info.set_error(&format!(
+                    "tantivy_save_index: cannot create destination '{}': {e}",
+                    dst.display()
+                ));
+                FfiInitData::<SaveState>::set(
+                    info,
+                    SaveState { name: String::new(), path: String::new(), docs: 0, done: true },
+                );
+                return;
+            }
+            if let Err(e) = copy_index_dir(src, &dst) {
+                init_info.set_error(&format!(
+                    "tantivy_save_index: cannot copy '{}' → '{}': {e}",
+                    src.display(), dst.display()
+                ));
+                FfiInitData::<SaveState>::set(
+                    info,
+                    SaveState { name: String::new(), path: String::new(), docs: 0, done: true },
+                );
+                return;
+            }
+        }
+
+        FfiInitData::<SaveState>::set(
+            info,
+            SaveState {
+                name: bind.name.clone(),
+                path: dst.to_string_lossy().into_owned(),
+                docs: idx.num_docs as i64,
+                done: false,
+            },
+        );
+    }
+});
+
+quack_rs::table_scan_callback!(save_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<SaveState>::get_mut(info) else {
+            unsafe { chunk.set_size(0) };
+            return;
+        };
+        if state.done {
+            unsafe { chunk.set_size(0) };
+            return;
+        }
+        let mut name_writer = unsafe { chunk.writer(0) };
+        let mut path_writer = unsafe { chunk.writer(1) };
+        let mut docs_writer = unsafe { chunk.writer(2) };
+        unsafe {
+            name_writer.write_varchar(0, &state.name);
+            path_writer.write_varchar(0, &state.path);
+            docs_writer.write_i64(0, state.docs);
+        }
+        state.done = true;
+        unsafe { chunk.set_size(1) };
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table function: tantivy_load_index(name, path)
+//   → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+//
+// Opens the persistent index stored at `path` (a directory produced by
+// `tantivy_create_index` / `tantivy_save_index` in any process) read-only and
+// registers it under `name` in THIS process's registry. The registry is
+// process-global, so `name` must not already be registered here (clear error;
+// v0.3 has no drop function — replace an index by rebuilding it under a fresh
+// name or in a fresh process).
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct LoadBind {
+    name: String,
+    path: String,
+}
+
+struct LoadState {
+    name: String,
+    path: String,
+    docs: i64,
+    language: String,
+    done: bool,
+}
+
+quack_rs::table_bind_callback!(load_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info.get_parameter_value(0).as_str().unwrap_or_default();
+        let path = bind_info.get_parameter_value(1).as_str().unwrap_or_default();
+
+        if !search::is_safe_index_name(&name) {
+            bind_info.set_error(
+                "tantivy_load_index: name must be a single identifier segment like 'my_index' or 'my-index'",
+            );
+            return;
+        }
+        if path.trim().is_empty() {
+            bind_info.set_error(
+                "tantivy_load_index: path (the index directory) is required",
+            );
+            return;
+        }
+        let registered = registry_lock().contains_key(&name);
+        if registered {
+            bind_info.set_error(&format!(
+                "tantivy_load_index: index '{name}' is already registered in this process; \
+                 v0.3 has no drop — use a different name (or a fresh process)"
+            ));
+            return;
+        }
+
+        bind_info
+            .add_result_column("name", TypeId::Varchar)
+            .add_result_column("path", TypeId::Varchar)
+            .add_result_column("docs", TypeId::BigInt)
+            .add_result_column("language", TypeId::Varchar)
+            .set_cardinality(1, true);
+        FfiBindData::<LoadBind>::set(
+            info,
+            LoadBind {
+                name: name.trim().to_string(),
+                path: path.trim().to_string(),
+            },
+        );
+    }
+});
+
+quack_rs::table_init_callback!(load_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+
+        let Some(bind) = FfiBindData::<LoadBind>::get_from_init(info) else {
+            FfiInitData::<LoadState>::set(
+                info,
+                LoadState {
+                    name: String::new(),
+                    path: String::new(),
+                    docs: 0,
+                    language: String::new(),
+                    done: true,
+                },
+            );
+            return;
+        };
+
+        let idx = match search::open_persistent(&bind.name, std::path::Path::new(&bind.path)) {
+            Ok(i) => i,
+            Err(e) => {
+                init_info.set_error(&format!("tantivy_load_index: {e}"));
+                FfiInitData::<LoadState>::set(
+                    info,
+                    LoadState {
+                        name: String::new(),
+                        path: String::new(),
+                        docs: 0,
+                        language: String::new(),
+                        done: true,
+                    },
+                );
+                return;
+            }
+        };
+        let out = LoadState {
+            name: idx.name.clone(),
+            path: idx.path.clone(),
+            docs: idx.num_docs as i64,
+            language: idx.language.clone(),
+            done: false,
+        };
+        // Re-check + insert: a concurrent load of the same name must lose
+        // with a clear error, never a silent duplicate/overwrite.
+        match registry_lock().insert(out.name.clone(), Arc::new(idx)) {
+            Some(_prev) => {
+                init_info.set_error(&format!(
+                    "tantivy_load_index: index '{}' was registered concurrently; it now points at the newer load",
+                    out.name
+                ));
+            }
+            None => {}
+        }
+
+        FfiInitData::<LoadState>::set(info, out);
+    }
+});
+
+quack_rs::table_scan_callback!(load_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<LoadState>::get_mut(info) else {
+            unsafe { chunk.set_size(0) };
+            return;
+        };
+        if state.done {
+            unsafe { chunk.set_size(0) };
+            return;
+        }
+        let mut name_writer = unsafe { chunk.writer(0) };
+        let mut path_writer = unsafe { chunk.writer(1) };
+        let mut docs_writer = unsafe { chunk.writer(2) };
+        let mut lang_writer = unsafe { chunk.writer(3) };
+        unsafe {
+            name_writer.write_varchar(0, &state.name);
+            path_writer.write_varchar(0, &state.path);
+            docs_writer.write_i64(0, state.docs);
+            lang_writer.write_varchar(0, &state.language);
+        }
+        state.done = true;
+        unsafe { chunk.set_size(1) };
     }
 });
 
@@ -1715,6 +2173,36 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .bind(psearch_bind)
             .init(psearch_init)
             .scan(psearch_scan),
+    )?;
+
+    // tantivy_list() → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+    // (snapshot of the process-global registry of persistent indexes)
+    con.register_table(
+        TableFunctionBuilder::new("tantivy_list")
+            .bind(list_bind)
+            .init(list_init)
+            .scan(list_scan),
+    )?;
+
+    // tantivy_save_index(name, [path := '']) → name VARCHAR, path VARCHAR, docs BIGINT
+    // (copies the index directory; without `path` reports where it lives)
+    con.register_table(
+        TableFunctionBuilder::new("tantivy_save_index")
+            .param(TypeId::Varchar)
+            .named_param("path", TypeId::Varchar)
+            .bind(save_bind)
+            .init(save_init)
+            .scan(save_scan),
+    )?;
+
+    // tantivy_load_index(name, path) → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+    con.register_table(
+        TableFunctionBuilder::new("tantivy_load_index")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .bind(load_bind)
+            .init(load_init)
+            .scan(load_scan),
     )?;
 
     con.register_table(
