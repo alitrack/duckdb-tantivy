@@ -12,6 +12,11 @@ JSON shims: table functions bind to real tables and stream real columns.
 | Function | Description |
 |---|---|
 | `bm25_search(table, query, [id_column := ''], [text_column := 'body'], [language := 'english'], [top_k := 100])` | BM25 search over a table → `doc_id BIGINT, score DOUBLE` |
+| `tantivy_create_index(name, table, [id_column := ''], [text_column := 'body'], [language := 'english'], [path := ''])` | Build a **persistent** on-disk (mmap-backed) index `name` from a table and register it in the process → `name, path, docs, language` (v0.3) |
+| `tantivy_search_index(name, query, [top_k := 10])` | BM25 search against a registered persistent index → `doc_id BIGINT, score DOUBLE`. Same query semantics and tie-break as `bm25_search` → identical results (v0.3) |
+| `tantivy_list()` | The registered persistent indexes → `name, path, docs, language` (v0.3) |
+| `tantivy_save_index(name, [path := ''])` | Copy a registered index's directory to `path` (or report where it lives without `path`) → `name, path, docs` (v0.3) |
+| `tantivy_load_index(name, path)` | Open a previously saved index directory (from any process) read-only and register it under `name` → `name, path, docs, language` (v0.3) |
 | `tantivy_terms(table, [text_column := 'body'])` | Raw-term (unstemmed, lowercased) dictionary of the table → `term VARCHAR, df BIGINT`. Document-frequency per term; the correction-space dictionary for typo-tolerance macro layers. |
 | `supported_languages()` | The 18 Snowball languages tantivy can stem, plus `chinese (jieba)` |
 | `tokenize(text)` / `tokenize(text, language)` | Tokenize (+ stem if language given) → `VARCHAR[]`. `language := 'chinese'` (alias `zh`) uses jieba word segmentation instead of Snowball |
@@ -81,6 +86,58 @@ To rebuild and re-verify the whole chain from scratch (offline, rebuild + stamp 
 bash scripts/run_chinese_e2e.sh
 ```
 
+## Persistent indexes (v0.3)
+
+The v0.2 surface is *ephemeral*: every `bm25_search` rebuilds a RAM index. v0.3
+adds **named persistent indexes** — built once from a table, stored on disk in
+a directory (mmap-backed, no background server), and searched repeatedly:
+
+```sql
+-- build once (default location: $TANTIVY_INDEX_DIR/<name>, else .tantivy_index/<name>)
+SELECT * FROM tantivy_create_index('news', 'articles', id_column := 'id');
+
+-- search any number of times — no rebuild, no table access
+SELECT * FROM tantivy_search_index('news', 'crude oil', top_k := 20);
+SELECT * FROM tantivy_list();
+
+-- back it up / move it to another machine (or report where it lives)
+SELECT * FROM tantivy_save_index('news', path := '/backup/news_index');
+
+-- in a fresh process (or under a new name): open it and search
+SELECT * FROM tantivy_load_index('news_copy', '/backup/news_index');
+```
+
+Semantics:
+
+- **Same ranking as `bm25_search`.** `tantivy_search_index` uses exactly the
+  same query pipeline (NFC normalization, metacharacter sanitization,
+  conjunctive/AND matching, and the score-desc/doc-id-asc tie-break honored at
+  the cutoff), so a persistent index and a fresh `bm25_search` over the same
+  rows with the same parameters return **bit-identical** `(doc_id, score)`
+  rows. The e2e harness diffs exactly that across fresh processes (english and
+  chinese) and enforces it on every run.
+- **The index is immutable.** `tantivy_create_index` *rebuilds*: the index
+  directory is wiped and re-indexed from the table's current rows (like
+  `CREATE OR REPLACE` — never a silent append). There is no incremental
+  update and no `drop` in v0.3: replace an index by rebuilding it under a
+  fresh name, or in a fresh process.
+- **The registry is process-global.** Registered indexes live for the life of
+  the DuckDB process, in a process-wide registry (like duckdb-vss's). Loading
+  a name that is already registered is a clear error.
+- **Provenance.** Every index directory carries a `__tantivy_meta.json`
+  sidecar (name + language); `tantivy_load_index` refuses directories without
+  it (foreign or corrupt index → clear error, never a guess).
+- `language := 'chinese'` (jieba) works exactly as in `bm25_search` — a saved
+  Chinese index loads and searches identically in a fresh process.
+
+To rebuild and re-verify the persistent chain (offline, full suite +
+cross-process save→load bit-identity diffs + 100k-row performance, exit 0 = all
+green):
+
+```sh
+bash scripts/run_persistent_e2e.sh
+```
+
 ## Hard limits (by design — they become clean SQL errors, never crashes or silent data loss)
 
 | Limit | Value | Rationale |
@@ -89,6 +146,8 @@ bash scripts/run_chinese_e2e.sh
 | Rows indexed per `bm25_search` call | 1,000,000 (plus a proportional text-bytes cap) | the extension builds an in-RAM index per call; add a `WHERE` clause for larger tables |
 | Per-text length | 16 MiB | one row cannot blow up tokenization |
 | `tokenize` output per call | 1,000,000 elements | overflow is reported as an error, never as silent NULL rows |
+| `tantivy_create_index` corpus | 1,000,000 rows (+ proportional text-bytes cap), same as `bm25_search` | enforced by the same pre-flight measurement before any row is copied; the index directory is wiped before a rebuild, never appended to |
+| Index names | single identifier segment, `[A-Za-z_][A-Za-z0-9_-]*` ≤ 128 chars | names double as directory names — no separators, dots, or traversal |
 
 ## Known limitations
 
@@ -115,6 +174,13 @@ bash scripts/run_chinese_e2e.sh
   therefore not available by design.
 - `id_column` must be castable to `BIGINT`; non-integer id columns are not
   supported.
+- **Persistent indexes are process-scoped with no drop (v0.3).** The registry
+  is process-global: indexes registered in a DuckDB process stay registered
+  until the process exits, and there is no `tantivy_drop_index` — to replace
+  an index, rebuild it under a different name or in a fresh process. On-disk
+  directories outlive the process; `tantivy_load_index` re-registers them. A
+  `tantivy_create_index` with an explicit `path` takes ownership of that
+  directory (wipes it on rebuild) — never point it at a directory you need.
 - The in-repo CI/release workflows build for `linux_amd64`, `osx_arm64`,
   `osx_amd64`, and `windows_amd64` (one native build per platform runner).
   Artifacts are **unsigned** (load with `duckdb -unsigned`); code-signing and

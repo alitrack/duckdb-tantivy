@@ -66,8 +66,8 @@ fn out_dir() -> String {
 }
 
 fn dump(d: &InMemoryDb, out: &str, file: &str, query: &str) {
-    d.execute_batch(&format!("COPY ({query}) TO '{out}/{file}.csv' (HEADER)")
-        .expect("copy out"));
+    d.execute_batch(&format!("COPY ({query}) TO '{out}/{file}.csv' (HEADER)"))
+        .expect("copy out");
 }
 
 #[test]
