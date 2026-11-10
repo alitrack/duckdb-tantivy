@@ -987,6 +987,150 @@ quack_rs::table_scan_callback!(create_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Table function: tantivy_search_index(name, query, [top_k := 10])
+//   → doc_id BIGINT, score DOUBLE
+//
+// BM25 search against a PERSISTENT index registered under `name` (by
+// `tantivy_create_index` or `tantivy_load_index`). Query semantics are exactly
+// `bm25_search`'s (NFC + metacharacter sanitization, conjunction/AND, and the
+// full-match-set tie-break honored at the cutoff), so both functions agree
+// bit-for-bit on the same corpus + parameters. No session connection is
+// needed — the index is on disk, not in a table.
+//
+// bind  : validate `name` (safe identifier, registered) and `top_k`.
+// init  : clone the index handle out of the registry (lock held only for the
+//         clone), run the search lock-free, keep the ranked hits.
+// scan  : emit the hits in batches (identical shape to bm25_search).
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct PSearchBind {
+    name: String,
+    query: String,
+    limit: i64,
+}
+
+struct PSearchState {
+    hits: Vec<search::Hit>,
+    next: usize,
+}
+
+quack_rs::table_bind_callback!(psearch_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info.get_parameter_value(0).as_str().unwrap_or_default();
+        let query = bind_info.get_parameter_value(1).as_str().unwrap_or_default();
+
+        // `top_k` defaults to 10 (the persistent-search default) and shares
+        // bm25_search's [1, 100_000] bounds: below 1 is a semantic error, and
+        // above the cap the full-match-set collector allocation grows without
+        // bound. Out-of-range values are rejected, never clamped.
+        let limit = match bind_info.get_named_parameter_value("top_k").as_i64() {
+            Some(v) if (1..=100_000).contains(&v) => v,
+            Some(v) => {
+                bind_info.set_error(&format!(
+                    "tantivy_search_index: top_k must be between 1 and 100000 (got {v})"
+                ));
+                return;
+            }
+            None => 10,
+        };
+
+        if !search::is_safe_index_name(&name) {
+            bind_info.set_error(
+                "tantivy_search_index: name must be a single identifier segment like 'my_index' or 'my-index'",
+            );
+            return;
+        }
+        // Bind-time existence check: a missing index is a clear, early error
+        // (naming the two ways to create one) rather than a surprise at init.
+        let registered = registry_lock().contains_key(&name);
+        if !registered {
+            bind_info.set_error(&format!(
+                "tantivy_search_index: no persistent index '{name}' is registered; \
+                 create it with tantivy_create_index or tantivy_load_index \
+                 (see tantivy_list() for registered names)"
+            ));
+            return;
+        }
+
+        bind_info
+            .add_result_column("doc_id", TypeId::BigInt)
+            .add_result_column("score", TypeId::Double)
+            .set_cardinality(limit as u64, false);
+        FfiBindData::<PSearchBind>::set(
+            info,
+            PSearchBind {
+                name: name.trim().to_string(),
+                query,
+                limit,
+            },
+        );
+    }
+});
+
+quack_rs::table_init_callback!(psearch_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+
+        let Some(bind) = FfiBindData::<PSearchBind>::get_from_init(info) else {
+            FfiInitData::<PSearchState>::set(info, PSearchState { hits: Vec::new(), next: 0 });
+            return;
+        };
+
+        // Clone the Arc out of the registry and release the lock before the
+        // search (lock discipline: the registry lock is never held across a
+        // query). A concurrent rebuild between bind and init is possible in
+        // principle; re-checking here keeps the failure explicit.
+        let idx: Arc<search::PersistentIndex> = match registry_lock().get(&bind.name).cloned() {
+            Some(i) => i,
+            None => {
+                init_info.set_error(&format!(
+                    "tantivy_search_index: no persistent index '{}' is registered",
+                    bind.name
+                ));
+                FfiInitData::<PSearchState>::set(info, PSearchState { hits: Vec::new(), next: 0 });
+                return;
+            }
+        };
+
+        let hits = match search::persistent_search(&idx, &bind.query, bind.limit as usize) {
+            Ok(h) => h,
+            Err(e) => {
+                init_info.set_error(&format!("tantivy_search_index: {e}"));
+                FfiInitData::<PSearchState>::set(info, PSearchState { hits: Vec::new(), next: 0 });
+                return;
+            }
+        };
+        FfiInitData::<PSearchState>::set(info, PSearchState { hits, next: 0 });
+    }
+});
+
+quack_rs::table_scan_callback!(psearch_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<PSearchState>::get_mut(info) else {
+            unsafe { chunk.set_size(0) };
+            return;
+        };
+        if state.next >= state.hits.len() {
+            unsafe { chunk.set_size(0) };
+            return;
+        }
+        let batch = (state.hits.len() - state.next).min(duckdb_vector_size() as usize);
+        let mut id_writer = unsafe { chunk.writer(0) };
+        let mut score_writer = unsafe { chunk.writer(1) };
+        for i in 0..batch {
+            let hit = &state.hits[state.next + i];
+            unsafe { id_writer.write_i64(i, hit.doc_id) };
+            unsafe { score_writer.write_f64(i, hit.score) };
+        }
+        state.next += batch;
+        unsafe { chunk.set_size(batch) };
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Table function: supported_languages() → lang VARCHAR
 // (19 rows: 18 Snowball languages + `chinese (jieba)`, see language_display)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1559,6 +1703,18 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .bind(create_bind)
             .init(create_init)
             .scan(create_scan),
+    )?;
+
+    // tantivy_search_index(name, query, [top_k := 10])
+    //   → doc_id BIGINT, score DOUBLE  (same tie-break as bm25_search)
+    con.register_table(
+        TableFunctionBuilder::new("tantivy_search_index")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .named_param("top_k", TypeId::BigInt)
+            .bind(psearch_bind)
+            .init(psearch_init)
+            .scan(psearch_scan),
     )?;
 
     con.register_table(
