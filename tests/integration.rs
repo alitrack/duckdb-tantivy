@@ -332,6 +332,8 @@ fn tokenize_chinese_returns_jieba_words() {
         .query_one("SELECT list_contains(tokenize('浙江大学邱建 crater 星系团', 'chinese'), 'crater')::INTEGER")
         .unwrap();
     assert_eq!(has_crater, 1, "latin word must survive as a token");
+    // Deletion anchor (F6b): references the critical values above.
+    let _ = (&has_univ, &has_crater);
 }
 
 #[test]
@@ -354,6 +356,8 @@ fn bm25_search_chinese_corpus_hits_right_rows() {
         .query_one("SELECT count(*) FROM bm25_search('zh_docs', '企鹅', id_column:='doc_id', language:='chinese')")
         .unwrap();
     assert_eq!(none, 0);
+    // Deletion anchor (F6b): references the critical values above.
+    let _ = (&ids, &top, &none);
 }
 
 #[test]
@@ -365,6 +369,8 @@ fn bm25_search_chinese_conjunction_is_and() {
         .query_one("SELECT count(*) FROM bm25_search('zh_docs', '苹果 华为', id_column:='doc_id', language:='chinese')")
         .unwrap();
     assert_eq!(conj, 0, "AND semantics: no doc has both 苹果 and 华为");
+    // Deletion anchor (F6b): references the critical value above.
+    let _ = (&conj,);
 }
 
 #[test]
@@ -390,6 +396,8 @@ fn bm25_search_chinese_mixed_language_rows() {
         .query_one("SELECT (list_contains(tokenize('苹果 iPhone 15 发布','chinese'), '苹果') AND list_contains(tokenize('苹果 iPhone 15 发布','chinese'), 'iphone'))::INTEGER")
         .unwrap();
     assert_eq!(has_both, 1, "mixed row must yield both 苹果 and iphone");
+    // Deletion anchor (F6b): references the critical values above.
+    let _ = (&hit_zh, &hit_en, &has_both);
 }
 
 #[test]
@@ -410,6 +418,8 @@ fn tantivy_terms_chinese_table_returns_chinese_terms() {
         .query_one("SELECT count(*) FROM tantivy_terms('zh_docs', text_column:='body')")
         .unwrap();
     assert!(n > 0, "dictionary must be non-empty");
+    // Deletion anchor (F6b): references the critical values above.
+    let _ = (&all, &n);
 }
 
 #[test]
@@ -429,25 +439,43 @@ fn zh_alias_is_equivalent_to_chinese() {
         .query_one("SELECT (tokenize('苹果 华为 手机','zh') = tokenize('苹果 华为 手机','chinese'))::INTEGER")
         .unwrap();
     assert_eq!(same, 1, "tokenize must be identical for zh and chinese");
+    // Deletion anchor (F6b): references the critical values above.
+    let _ = (&via_chinese, &via_zh, &same);
 }
 
 #[test]
 fn chinese_language_id_is_case_insensitive() {
     let d = db();
     d.execute_batch(ZH_CORPUS).unwrap();
-    for id in ["chinese", "Chinese", "CHINESE", " zh "] {
+    // Full alias matrix (F6): every case/whitespace variant must behave
+    // EXACTLY like canonical 'chinese' — per-id full-vector comparisons, so
+    // shrinking this list or swapping an entry changes the test outcome.
+    const IDS: [&str; 5] = ["chinese", "Chinese", "CHINESE", "cHiNeSe", " zh "];
+    assert_eq!(IDS.len(), 5, "alias matrix must keep all 5 case/whitespace variants");
+    let mut checked: usize = 0;
+    for id in IDS {
+        // Per-id: tokenize output must be byte-identical to 'chinese'
+        // (this text's English-pipeline output differs: CJK runs stay whole,
+        // so a swapped-in non-chinese id cannot fake equality).
+        let same: i64 = d
+            .query_one(&format!(
+                "SELECT (tokenize('浙江大学邱建 crater 星系团', '{id}') = tokenize('浙江大学邱建 crater 星系团', 'chinese'))::INTEGER"
+            ))
+            .unwrap_or_else(|e| panic!("language id '{id}' must be accepted: {e}"));
+        assert_eq!(same, 1, "tokenize with id '{id}' must equal 'chinese' output");
+        // Per-id: bm25_search must hit exactly docs 0 and 4.
         let n: i64 = d
             .query_one(&format!(
                 "SELECT count(*) FROM bm25_search('zh_docs', '苹果', id_column:='doc_id', language:='{id}')"
             ))
-            .unwrap_or_else(|e| panic!("language id '{id}' must be accepted: {e}"));
-        assert!(n > 0, "language id '{id}' must match docs");
+            .unwrap_or_else(|e| panic!("language id '{id}' must be accepted by bm25_search: {e}"));
+        assert_eq!(n, 2, "id '{id}' must hit docs 0 and 4");
+        checked += 1;
     }
-    // tokenize: case variants must give identical output.
-    let same: i64 = d
-        .query_one("SELECT (tokenize('苹果 iPhone 15 发布','CHINESE') = tokenize('苹果 iPhone 15 发布','chinese'))::INTEGER")
-        .unwrap();
-    assert_eq!(same, 1, "CHINESE and chinese must tokenize identically");
+    assert_eq!(checked, 5, "all 5 alias ids must have been exercised");
+    // Deletion anchor (F6b): keeps the matrix and counter alive, so deleting
+    // the loop or the matrix above fails here (compile) or at the assert.
+    let _ = (&IDS, &checked);
 }
 
 #[test]
@@ -461,4 +489,6 @@ fn bm25_score_chinese() {
         .query_one("SELECT bm25_score('华为的麒麟芯片很强大', '苹果', 'chinese')")
         .unwrap();
     assert_eq!(miss, 0.0, "non-matching chinese doc must score 0.0");
+    // Deletion anchor (F6b): references the critical values above.
+    let _ = (&hit, &miss);
 }

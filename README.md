@@ -15,7 +15,7 @@ JSON shims: table functions bind to real tables and stream real columns.
 | `tantivy_terms(table, [text_column := 'body'])` | Raw-term (unstemmed, lowercased) dictionary of the table → `term VARCHAR, df BIGINT`. Document-frequency per term; the correction-space dictionary for typo-tolerance macro layers. |
 | `supported_languages()` | The 18 Snowball languages tantivy can stem, plus `chinese (jieba)` |
 | `tokenize(text)` / `tokenize(text, language)` | Tokenize (+ stem if language given) → `VARCHAR[]`. `language := 'chinese'` (alias `zh`) uses jieba word segmentation instead of Snowball |
-| `stem(word, language)` | Snowball-stem a single word (`chinese`/`zh`: no stemmer, returns the lowercased word) |
+| `stem(word, language)` | Snowball-stem a single word (`chinese`/`zh`: no stemmer, returns the original word unchanged — 中文无词干，恒等返回原词，不拆分、不插入空格) |
 | `bm25_score(doc, query)` / `bm25_score(doc, query, language)` | BM25 score of one doc against a query |
 | `tantivy_version()` | Version string of the embedded tantivy |
 
@@ -74,6 +74,12 @@ SELECT language := 'zh'  -- alias, identical behaviour to 'chinese'
 analyzer), so for CJK it surfaces whole contiguous Han runs as surface terms —
 use `bm25_search`/`tokenize` with `language := 'chinese'` when you need
 word-level Chinese terms.
+
+To rebuild and re-verify the whole chain from scratch (offline, rebuild + stamp + full test suite + Chinese assertions, exit 0 = all green):
+
+```sh
+bash scripts/run_chinese_e2e.sh
+```
 
 ## Hard limits (by design — they become clean SQL errors, never crashes or silent data loss)
 

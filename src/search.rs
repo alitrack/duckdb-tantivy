@@ -21,7 +21,7 @@
 //! than panicking. The extension never panics on caller input.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use jieba_rs::Jieba;
 use tantivy::collector::TopDocs;
@@ -190,12 +190,29 @@ fn stem_analyzer(lang: TvLanguage) -> TextAnalyzer {
         .build()
 }
 
+/// Process-wide jieba instance. The embedded dictionary (~349k entries) is
+/// decompressed and loaded into the cedar trie exactly ONCE per process; every
+/// [`JiebaTokenizer`] — and thus every analyzer clone tantivy builds for its
+/// writer/segment/query-parser paths — shares this single instance behind an
+/// `Arc`. This mirrors upstream `tantivy-jieba`, which holds a process-global
+/// `Jieba` in a `lazy_static!`. Without the `OnceLock` each `chinese`-language
+/// call would rebuild the whole dictionary (measured: +20 MB RSS, tens of ms
+/// per call), and the scalar paths (`tokenize`/`stem`/`bm25_score`) pay it
+/// per row.
+static JIEBA: OnceLock<Arc<Jieba>> = OnceLock::new();
+
+/// Fetch the process-wide [`Jieba`], loading the embedded dictionary on first
+/// use only.
+fn shared_jieba() -> Arc<Jieba> {
+    JIEBA.get_or_init(|| Arc::new(Jieba::new())).clone()
+}
+
 /// A tantivy [`Tokenizer`] backed by jieba-rs: Chinese word segmentation with
-/// the HMM path for out-of-dictionary words. The dictionary is embedded in the
-/// crate (no file IO) and loaded once; the [`Jieba`] instance is shared behind
-/// an `Arc` across clones so every analyzer instance reuses it. `cut` returns
-/// borrows of the input, so tokens are copied into owned `String`s here and
-/// whitespace/punctuation-only tokens are dropped (jieba passes them through).
+/// the HMM path for out-of-dictionary words. `cut` returns slices of the
+/// input; whitespace/punctuation-only fragments are dropped (jieba passes
+/// them through) and the kept slices carry real byte offsets into the input,
+/// computed by pointer difference in [`JiebaTokenStream::advance`]. The
+/// dictionary itself is loaded once per process (see [`JIEBA`]).
 struct JiebaTokenizer {
     jieba: Arc<Jieba>,
 }
@@ -211,31 +228,34 @@ impl Clone for JiebaTokenizer {
 impl JiebaTokenizer {
     fn new() -> Self {
         JiebaTokenizer {
-            jieba: Arc::new(Jieba::new()),
+            jieba: shared_jieba(),
         }
     }
 }
 
-struct JiebaTokenStream {
-    words: std::vec::IntoIter<String>,
+struct JiebaTokenStream<'a> {
+    text: &'a str,
+    words: std::vec::IntoIter<&'a str>,
     position: usize,
     token: Token,
 }
 
 impl Tokenizer for JiebaTokenizer {
-    type TokenStream<'a> = JiebaTokenStream;
+    type TokenStream<'a> = JiebaTokenStream<'a>;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        let words: Vec<String> = self
+        // Keep slices carrying at least one alphanumeric character; drops the
+        // whitespace/punctuation fragments jieba emits between words. `cut`
+        // returns slices of `text`, so the kept items stay borrows of the
+        // input — pointer difference in `advance` below is a real offset.
+        let words: Vec<&'a str> = self
             .jieba
             .cut(text, true)
             .into_iter()
-            // Keep tokens carrying at least one alphanumeric character; drops
-            // the whitespace/punctuation fragments jieba emits between words.
             .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
-            .map(|w| w.to_string())
             .collect();
         JiebaTokenStream {
+            text,
             words: words.into_iter(),
             position: 0,
             token: Token {
@@ -249,21 +269,23 @@ impl Tokenizer for JiebaTokenizer {
     }
 }
 
-impl TokenStream for JiebaTokenStream {
+impl<'a> TokenStream for JiebaTokenStream<'a> {
     fn advance(&mut self) -> bool {
         self.token.reset();
         let Some(word) = self.words.next() else {
             return false;
         };
-        // Offsets track the kept-token sequence (jieba's dropped fragments
-        // between words are not counted); they stay monotonic, which is all
-        // tantivy requires — position data is what conjunction queries use.
-        self.token.offset_from = self.token.offset_to;
-        self.token.offset_to += word.len();
+        // Real offsets: jieba's `cut` returns slices of the input text, so the
+        // pointer difference is the token's true byte position in the original
+        // input (same technique as tantivy-jieba). Offsets therefore always
+        // fall on char boundaries and `&text[offset_from..offset_to]` slices
+        // back to exactly the token text — the tantivy Tokenizer contract.
+        self.token.offset_from = word.as_ptr() as usize - self.text.as_ptr() as usize;
+        self.token.offset_to = self.token.offset_from + word.len();
         self.token.position = self.position;
         self.token.position_length = 1;
         self.position += 1;
-        self.token.text = word;
+        self.token.text.push_str(word);
         true
     }
     fn token(&self) -> &Token {
@@ -321,14 +343,21 @@ pub fn tokenize_lang(text: &str, lang: &str) -> Result<Vec<String>> {
 }
 
 /// Reduce a single `word` for `lang`: Snowball-stemmed for the 18 stemmer
-/// languages, jieba-segmented (no stem) for `chinese`. The whole input is
-/// treated as one token run, lowercased then stemmed/segmented. Empty word →
-/// empty string; unknown language → error. E.g. `stem("running","english") ==
-/// "run"`; for Chinese the word comes back lowercased as-is.
+/// languages. `chinese` has no word stems, so the input is returned
+/// UNCHANGED (identity) — the same "one word in, one word out" contract the
+/// 18 stemmer languages honor: `stem` never splits a multi-word input and
+/// never space-joins (segmenting a phrase is `tokenize`'s job, not `stem`'s).
+/// Empty word → empty string; unknown language → error. E.g.
+/// `stem("running","english") == "run"`, `stem("苹果手机","chinese") == "苹果手机"`.
 pub fn stem(word: &str, lang: &str) -> Result<String> {
     check_text_len(word)?;
     let l = resolve_language(lang)?;
-    let toks = run_analyzer(analyzer_for(&l), word);
+    if matches!(l, Lang::Chinese) {
+        // Chinese has no word stems: identity preserves the single-word contract.
+        return Ok(word.to_string());
+    }
+    let Lang::Snowball(tl) = l else { unreachable!("chinese handled above"); };
+    let toks = run_analyzer(stem_analyzer(tl), word);
     // A lone word yields a single token; join defensively if the tokenizer split.
     Ok(toks.join(" "))
 }
@@ -914,10 +943,14 @@ mod tests {
     }
 
     #[test]
-    fn stem_chinese_is_identity_lowercased() {
-        // No stemmer for Chinese: a word comes back as-is (lowercased latin).
+    fn stem_chinese_is_identity() {
+        // No stemmer for Chinese: identity — even multi-word input comes back
+        // unchanged (no splitting, no space-joined output; that would violate
+        // the single-word contract the 18 Snowball languages honor).
         assert_eq!(stem("苹果", "chinese").unwrap(), "苹果");
-        assert_eq!(stem("iPhone", "chinese").unwrap(), "iphone");
+        // F1 regression pin: multi-word input must NOT come back space-joined.
+        assert_eq!(stem("苹果手机", "chinese").unwrap(), "苹果手机");
+        assert_eq!(stem("iPhone", "chinese").unwrap(), "iPhone");
     }
 
     #[test]
@@ -944,5 +977,34 @@ mod tests {
         assert!(SUPPORTED_LANGUAGES.contains(&"chinese"));
         assert_eq!(language_display("chinese"), "chinese (jieba)");
         assert_eq!(language_display("english"), "english");
+    }
+
+    /// F3 regression: JiebaTokenStream offsets must be REAL byte ranges into
+    /// the original text — on char boundaries, with
+    /// &text[offset_from..offset_to] == token text. Includes a mixed
+    /// Chinese/latin line where the old accumulated offsets pointed at the
+    /// wrong words (and could panic mid-character on &text[a..b]).
+    #[test]
+    fn jieba_token_offsets_slice_original_text() {
+        let cases: [(&str, usize); 4] = [
+            ("苹果 iPhone 15 发布", 4),
+            ("苹果 发布了 新款手机，crater 星系团。", 6),
+            ("浙江大学邱建 crater 星系团", 4),
+            ("今天天气很好适合运动", 1),
+        ];
+        for (text, min) in cases {
+            let mut tokenizer = JiebaTokenizer::new();
+            let mut stream = tokenizer.token_stream(text);
+            let mut n = 0;
+            stream.process(&mut |tok| {
+                let slice = &text[tok.offset_from..tok.offset_to];
+                assert_eq!(
+                    slice, tok.text,
+                    "token {n} of {text:?}: offsets must slice the original text"
+                );
+                n += 1;
+            });
+            assert!(n >= min, "expected >= {min} tokens for {text:?}, got {n}");
+        }
     }
 }

@@ -6,13 +6,13 @@
 #
 # Self-contained: a coordinator taking over an interrupted session can run
 # this script directly to rebuild the extension and harvest test evidence.
-# All cargo invocations are --offline (no network) and bounded by timeout.
+# All cargo invocations are --offline --locked (no network, no lock re-resolution) and bounded by timeout.
 
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "=== [1/4] cargo build --release --offline ==="
-timeout 1800 cargo build --release --offline
+timeout 1800 cargo build --release --offline --locked
 
 echo "=== [2/4] stamp .duckdb_extension metadata (same step as 'make release') ==="
 PYTHON_BIN=./configure/venv/bin/python3
@@ -27,12 +27,12 @@ cp build/release/tantivy.duckdb_extension target/release/tantivy.duckdb_extensio
 echo "stamped: target/release/tantivy.duckdb_extension"
 
 echo "=== [3/4] cargo test --release --offline (full suite: unit + SQL e2e) ==="
-timeout 1800 cargo test --release --offline
+timeout 1800 cargo test --release --offline --locked
 
 echo "=== [4/4] Chinese (jieba) focused assertions — evidence run ==="
-timeout 900 cargo test --release --offline --lib -- --nocapture chinese
-timeout 900 cargo test --release --offline --test integration -- --nocapture chinese
-timeout 900 cargo test --release --offline --test integration -- --nocapture zh_alias
+timeout 900 cargo test --release --offline --locked --lib -- --nocapture chinese
+timeout 900 cargo test --release --offline --locked --test integration -- --nocapture chinese
+timeout 900 cargo test --release --offline --locked --test integration -- --nocapture zh_alias
 
 echo
 echo "ALL CHINESE E2E PASS"
