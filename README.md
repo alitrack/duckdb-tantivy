@@ -7,7 +7,7 @@ Extension API (ABI v1.2.0) through
 [quack-rs](https://github.com/tomtom215/quack-rs). No VGI, no Arrow IPC, no
 JSON shims: table functions bind to real tables and stream real columns.
 
-**Current release: v0.3.0** — persistent named indexes
+**Current release: v0.4.0** — wasm support; persistent named indexes (v0.3.0)
 (`tantivy_create_index` / `tantivy_search_index` / `tantivy_save_index` /
 `tantivy_load_index` / `tantivy_list`) on top of the v0.2 BM25 surface.
 DuckDB C Extension API v1.2.0; artifacts are **unsigned** (load with
@@ -256,6 +256,12 @@ bash scripts/run_persistent_e2e.sh
 
 ## Known limitations
 
+- **wasm builds: persistent named indexes are native-only.** The extension
+  compiles for wasm32 (tantivy runs on its in-RAM directory), so `bm25_search`,
+  `tantivy_terms`, the `tokenize`/`stem`/`bm25_score` scalars, and `tantivy_stats`
+  work in DuckDB-WASM — but `tantivy_create_index` with a `path`, and
+  `tantivy_load_index`, return a clear error there (no filesystem, no mmap).
+  wasm callers get an in-RAM ephemeral index instead.
 - **Temporary tables and uncommitted transactions are not visible to
   `bm25_search`.** DuckDB's C-API table-function callbacks do not receive the
   caller's connection, so the extension queries the table through a

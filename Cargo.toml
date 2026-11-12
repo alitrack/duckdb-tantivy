@@ -1,6 +1,6 @@
 [package]
 name = "duckdb-tantivy"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -23,7 +23,8 @@ path = "src-bin/append_metadata/main.rs"
 # the toolchain past it. We use its BM25 scoring, its tokenizer/Snowball-stemmer
 # stack, its in-process RAM-directory index (ephemeral searches), and — since
 # v0.3 — its MmapDirectory for persistent on-disk named indexes.
-tantivy = "=0.24.2"
+tantivy = { version = "=0.24.2", default-features = false }
+
 serde_json = "1"
 # jieba-rs — Chinese word segmentation (MIT). Pinned to the 0.7 line per the
 # feature design: 0.7.x's `cut()` API is stable, embeds the dictionary (no
@@ -47,6 +48,20 @@ quack-rs = "=0.18.0"
 # CI and the Makefile build with `--locked` so this ABI layer can never float
 # to an unvalidated 1.x patch release.
 libduckdb-sys = { version = "1.10504", features = ["loadable-extension"] }
+
+# wasm32: tantivy's default `mmap` feature pulls memmap2, which has no
+# wasm32-unknown-unknown story; disabling it switches tantivy to RamDirectory.
+# getrandom/uuid need their `js` backends on that target. Proven in
+# /tmp/tantivy-wasm-probe (cargo check --target wasm32-unknown-unknown OK).
+# Native builds keep the exact same tantivy code: RamDirectory is what the
+# ephemeral search path already uses; MmapDirectory sites below are cfg'd.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tantivy = { version = "=0.24.2", default-features = false, features = ["mmap", "stopwords", "lz4-compression"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tantivy = { version = "=0.24.2", default-features = false, features = ["stopwords", "lz4-compression"] }
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1", features = ["js"] }
 
 [dev-dependencies]
 # SQL-level integration tests: InMemoryDb compiles a real bundled DuckDB so the
