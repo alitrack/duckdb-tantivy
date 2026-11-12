@@ -55,9 +55,9 @@ jobs:
           targets: wasm32-unknown-emscripten
 
       - name: Setup Emscripten
-        uses: emscripten-core/setup-emsdk@v7
+        uses: emscripten-core/setup-emsdk@4528d102f7230f0e7b276855c01ea1159be0e984 # v16, same pin as extension-ci-tools
         with:
-          version: 'sdk-6.0.9-64bit'
+          version: '6.0.9'
 
       - name: Configure
         run: make configure_ci
