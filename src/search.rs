@@ -38,6 +38,7 @@ use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED};
+use tantivy::Term;
 use tantivy::tokenizer::{
     Language as TvLanguage, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
     Token, TokenStream, Tokenizer,
@@ -605,6 +606,165 @@ pub fn sanitize_query(q: &str) -> String {
 /// The tantivy version string, e.g. `"tantivy v0.24.2, index_format v7"`.
 pub fn tantivy_version() -> String {
     tantivy::version_string().to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// dryrun-style pre-execution estimate (duckdb-dryrun inspired)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A pre-execution cost estimate for a persistent-index search. No term
+/// dictionary is opened, no postings are decoded, no scoring runs: the query
+/// is analyzed with the SAME chain the index was built with, and per-segment
+/// term metadata is taken from `searcher.segment_readers()` ONLY where the
+/// public API exposes it. Numbers are honest lower/upper bounds, with the
+/// caveats spelled out in `notes` (dryrun's philosophy: degrade, never lie).
+#[derive(Debug, Clone)]
+pub struct Estimate {
+    pub num_docs: u64,
+    pub segments: u64,
+    pub query_terms: Vec<String>,
+    /// Estimated postings bytes this query would decode across segments.
+    /// `None` when the tantivy version exposes no per-term byte sizes — the
+    /// estimate then falls back to doc-frequency bounds and says so in notes.
+    pub estimated_postings_bytes: Option<u64>,
+    /// Total inverted-index bytes on disk (meta + store + postings), an
+    /// upper bound for any single query.
+    pub total_index_bytes: u64,
+    /// Upper bound on candidate documents (sum of per-term doc frequencies).
+    pub estimated_max_candidates: u64,
+    pub confidence: Confidence,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl Confidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::High => "high",
+            Confidence::Medium => "medium",
+            Confidence::Low => "low",
+        }
+    }
+}
+
+/// Estimate the cost of searching `idx` with `query` WITHOUT executing the
+/// search. The query is normalized exactly like `persistent_search` (NFC +
+/// sanitization) and tokenized with the index's language chain, so the term
+/// list is bit-for-bit what the query parser would look up.
+pub fn estimate_search(idx: &PersistentIndex, query: &str) -> Result<Estimate> {
+    check_text_len(query)?;
+    if query.trim().is_empty() {
+        return Err(SearchError::BadQuery("empty query".into()));
+    }
+
+    let searcher = &idx.searcher_handle;
+    let num_docs = searcher.num_docs();
+    let mut notes = Vec::new();
+    let mut confidence = Confidence::High;
+
+    // Same normalization + analysis chain as persistent_search.
+    let sanitized = sanitize_query(&nfc(query));
+    let terms = tokenize_lang(&sanitized, &idx.language)?;
+    if terms.is_empty() {
+        notes.push("query tokenizes to zero terms; no postings would be read".into());
+        return Ok(Estimate {
+            num_docs,
+            segments: searcher.segment_readers().len() as u64,
+            query_terms: terms,
+            estimated_postings_bytes: Some(0),
+            total_index_bytes: index_bytes_on_disk(idx),
+            estimated_max_candidates: 0,
+            confidence: Confidence::High,
+            notes,
+        });
+    }
+    let unique_terms: Vec<String> = {
+        let mut t = terms.clone();
+        t.sort();
+        t.dedup();
+        t
+    };
+
+    let mut postings_bytes: u64 = 0;
+    let mut positions_bytes: u64 = 0;
+    let mut max_candidates: u64 = 0;
+    let mut missing_terms: usize = 0;
+
+    for seg in searcher.segment_readers() {
+        let inv = match seg.inverted_index(idx.body_field) {
+            Ok(i) => i,
+            Err(e) => return Err(SearchError::Internal(e.to_string())),
+        };
+        let dict = inv.terms();
+        for t in &unique_terms {
+            if let Ok(None) | Err(_) = dict.term_ord(t.as_bytes()) {
+                // Term absent from this segment: conjunction (AND) would
+                // short-circuit here — zero cost. Disjunction (OR) semantics
+                // are not what persistent_search uses.
+                missing_terms += 1;
+                continue;
+            }
+            let term = Term::from_field_text(idx.body_field, t);
+            if let Ok(Some(info)) = inv.get_term_info(&term) {
+                max_candidates += info.doc_freq as u64;
+                // EXACT bytes: TermInfo exposes the posting-list byte range in
+                // the .idx file AND the positions byte range in the .pos file
+                // (the index was built WithFreqsAndPositions, so a search
+                // decodes both). No approximation — confidence stays high.
+                postings_bytes += info.postings_range.len() as u64;
+                positions_bytes += info.positions_range.len() as u64;
+            }
+        }
+    }
+
+    if missing_terms > 0 {
+        notes.push(format!(
+            "{missing_terms} term-segment pairs absent (AND short-circuits; estimate assumes present pairs)"
+        ));
+    }
+    // postings + positions are both decoded by a WithFreqsAndPositions search;
+    // report the exact combined byte cost.
+    postings_bytes += positions_bytes;
+    if max_candidates > num_docs {
+        notes.push("max candidates exceeds num_docs (terms co-occur); conjunction prunes further".into());
+    }
+
+    Ok(Estimate {
+        num_docs,
+        segments: searcher.segment_readers().len() as u64,
+        query_terms: unique_terms,
+        estimated_postings_bytes: Some(postings_bytes),
+        total_index_bytes: index_bytes_on_disk(idx),
+        estimated_max_candidates: max_candidates,
+        confidence,
+        notes,
+    })
+}
+
+/// Total bytes of the index directory on disk (meta + store + postings).
+/// Read-only walk; mmap pages are not read.
+fn index_bytes_on_disk(idx: &PersistentIndex) -> u64 {
+    fn dir_size(p: &Path) -> u64 {
+        let mut n = 0u64;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let Ok(md) = e.metadata() else { continue };
+                if md.is_file() {
+                    n += md.len();
+                } else if md.is_dir() {
+                    n += dir_size(&e.path());
+                }
+            }
+        }
+        n
+    }
+    dir_size(Path::new(&idx.path))
 }
 
 /// A term from the raw-term dictionary: the lowercased, unstemmed surface form

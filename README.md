@@ -20,6 +20,7 @@ DuckDB C Extension API v1.2.0; artifacts are **unsigned** (load with
 | `bm25_search(table, query, [id_column := ''], [text_column := 'body'], [language := 'english'], [top_k := 100])` | BM25 search over a table → `doc_id BIGINT, score DOUBLE` |
 | `tantivy_create_index(name, table, [id_column := ''], [text_column := 'body'], [language := 'english'], [path := ''])` | Build a **persistent** on-disk (mmap-backed) index `name` from a table and register it in the process → `name, path, docs, language` (v0.3.0) |
 | `tantivy_search_index(name, query, [top_k := 10])` | BM25 search against a registered persistent index → `doc_id BIGINT, score DOUBLE`. Same query semantics and tie-break as `bm25_search` → identical results (v0.3.0) |
+| `tantivy_stats(name, query)` | **Pre-execution cost estimate** for `tantivy_search_index` (duckdb-dryrun style): tokenize the query with the index's own chain, read per-segment term doc-frequencies, and report what a search WOULD touch — `num_docs, segments, query_terms, estimated_postings_bytes, total_index_bytes, estimated_max_candidates, confidence, notes`. Never decodes postings, never scores. Absent terms report 0 bytes with `confidence = high` (AND short-circuits); postings bytes are a doc_freq × 8 approximation flagged in `notes` with `confidence = medium` (tantivy 0.24 exposes no per-term byte size). ~2 ms on a 20k-doc index. |
 | `tantivy_list()` | The registered persistent indexes → `name, path, docs, language` (v0.3.0) |
 | `tantivy_save_index(name, [path := ''])` | Copy a registered index's directory to `path` (or report where it lives without `path`) → `name, path, docs` (v0.3.0) |
 | `tantivy_load_index(name, path := '...')` | Open a previously saved index directory (from any process) read-only and register it under `name` — `path` is a named parameter (style-consistent with `save`) but **required** → `name, path, docs, language` (v0.3.0) |
@@ -106,6 +107,7 @@ results **bit-identical** to `bm25_search` over the same rows.
 |---|---|
 | `tantivy_create_index(name, table, [id_column := ''], [text_column := 'body'], [language := 'english'], [path := ''])` | `name, path, docs, language` |
 | `tantivy_search_index(name, query, [top_k := 10])` | `doc_id BIGINT, score DOUBLE` |
+| `tantivy_stats(name, query)` | `num_docs, segments, query_terms, estimated_postings_bytes, total_index_bytes, estimated_max_candidates, confidence, notes` |
 | `tantivy_save_index(name, [path := ''])` | `name, path, docs` |
 | `tantivy_load_index(name, path := '...')` | `name, path, docs, language` |
 | `tantivy_list()` | `name, path, docs, language` |

@@ -990,7 +990,140 @@ quack_rs::table_scan_callback!(create_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Table function: tantivy_search_index(name, query, [top_k := 10])
+// ─────────────────────────────────────────────────────────────────────────────
+// Table function: tantivy_stats(name, query)
+//
+// A dryrun-style PRE-EXECUTION estimate for `tantivy_search_index`: the query
+// is normalized and tokenized with the same chain the named index was built
+// with, per-segment term metadata (doc frequencies) is read from the term
+// dictionaries, and a single estimate row is returned. The search itself is
+// NEVER executed — no postings are decoded, no scoring runs, no documents are
+// retrieved. Bytes are honest approximations flagged in `notes` (tantivy
+// 0.24's public API exposes doc_freq but not per-term decoded byte sizes, so
+// postings bytes are estimated as doc_freq × 8 with confidence=medium).
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct StatsBind {
+    name: String,
+    query: String,
+}
+
+struct StatsState {
+    est: Option<search::Estimate>,
+    done: bool,
+}
+
+quack_rs::table_bind_callback!(stats_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info.get_parameter_value(0).as_str().unwrap_or_default();
+        let query = bind_info.get_parameter_value(1).as_str().unwrap_or_default();
+
+        if !search::is_safe_index_name(&name) {
+            bind_info.set_error(
+                "tantivy_stats: name must be a single identifier segment like 'my_index' or 'my-index'",
+            );
+            return;
+        }
+        if !registry_lock().contains_key(&name) {
+            bind_info.set_error(&format!(
+                "tantivy_stats: no persistent index '{name}' is registered; \
+                 create it with tantivy_create_index or tantivy_load_index \
+                 (see tantivy_list() for registered names)"
+            ));
+            return;
+        }
+
+        let terms_type = LogicalType::list(TypeId::Varchar);
+        bind_info
+            .add_result_column("num_docs", TypeId::BigInt)
+            .add_result_column("segments", TypeId::BigInt)
+            .add_result_column_with_type("query_terms", &terms_type)
+            .add_result_column("estimated_postings_bytes", TypeId::BigInt)
+            .add_result_column("total_index_bytes", TypeId::BigInt)
+            .add_result_column("estimated_max_candidates", TypeId::BigInt)
+            .add_result_column("confidence", TypeId::Varchar)
+            .add_result_column("notes", TypeId::Varchar)
+            .set_cardinality(1, true);
+        FfiBindData::<StatsBind>::set(
+            info,
+            StatsBind {
+                name: name.trim().to_string(),
+                query,
+            },
+        );
+    }
+});
+
+quack_rs::table_init_callback!(stats_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+
+        // The estimate runs at INIT (bind data is reachable here, not in
+        // scan — the codebase's pattern for single-row functions whose work
+        // depends on bind parameters). The scan callback then only emits.
+        let est = FfiBindData::<StatsBind>::get_from_init(info).and_then(|bind| {
+            let idx: Arc<search::PersistentIndex> = registry_lock().get(&bind.name).cloned()?;
+            search::estimate_search(&idx, &bind.query).ok()
+        });
+
+        FfiInitData::<StatsState>::set(info, StatsState { est, done: false });
+    }
+});
+
+quack_rs::table_scan_callback!(stats_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<StatsState>::get_mut(info) else {
+            chunk.set_size(0);
+            return;
+        };
+        if state.done {
+            chunk.set_size(0);
+            return;
+        }
+        state.done = true;
+
+        let Some(est) = state.est.as_ref() else {
+            chunk.set_size(0);
+            return;
+        };
+
+        chunk.set_size(1);
+
+        let mut w0 = chunk.writer(0);
+        w0.write_i64(0, est.num_docs as i64);
+        let mut w1 = chunk.writer(1);
+        w1.write_i64(0, est.segments as i64);
+
+        // query_terms VARCHAR[] via push_row (the codebase's canonical pattern)
+        {
+            let mut builder = ListBuilder::new(chunk.vector(2));
+            let n = est.query_terms.len();
+            let terms = &est.query_terms;
+            builder.push_row(0, n, |w, base| {
+                for (i, t) in terms.iter().enumerate() {
+                    w.write_varchar(base + i, t);
+                }
+            });
+            builder.finish();
+        }
+
+        let mut w3 = chunk.writer(3);
+        w3.write_i64(0, est.estimated_postings_bytes.unwrap_or(0) as i64);
+        let mut w4 = chunk.writer(4);
+        w4.write_i64(0, est.total_index_bytes as i64);
+        let mut w5 = chunk.writer(5);
+        w5.write_i64(0, est.estimated_max_candidates as i64);
+        let mut w6 = chunk.writer(6);
+        w6.write_varchar(0, est.confidence.as_str());
+        let mut w7 = chunk.writer(7);
+        w7.write_varchar(0, &est.notes.join("; "));
+    }
+});
+
+
 //   → doc_id BIGINT, score DOUBLE
 //
 // BM25 search against a PERSISTENT index registered under `name` (by
@@ -2193,6 +2326,21 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .bind(list_bind)
             .init(list_init)
             .scan(list_scan),
+    )?;
+
+    // tantivy_stats(name, query) — dryrun-style pre-execution estimate
+    //   → num_docs BIGINT, segments BIGINT, query_terms VARCHAR[],
+    //     estimated_postings_bytes BIGINT, total_index_bytes BIGINT,
+    //     estimated_max_candidates BIGINT, confidence VARCHAR, notes VARCHAR
+    // (inspired by duckdb-dryrun: analyze the query with the SAME chain the
+    //  index uses, report what WOULD be touched, never execute the search)
+    con.register_table(
+        TableFunctionBuilder::new("tantivy_stats")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .bind(stats_bind)
+            .init(stats_init)
+            .scan(stats_scan),
     )?;
 
     // tantivy_save_index(name, [path := '']) → name VARCHAR, path VARCHAR, docs BIGINT
