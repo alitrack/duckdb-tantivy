@@ -78,6 +78,12 @@ jobs:
           test -f "$ART"
           head -c 4 "$ART" | od -An -tx1 | grep -q "00 61 73 6d"  # \0asm magic
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tantivy-${{ matrix.platform }}
+          path: build/${{ matrix.platform }}/extension/tantivy/tantivy.duckdb_extension.wasm
+
       - name: Upload to release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
