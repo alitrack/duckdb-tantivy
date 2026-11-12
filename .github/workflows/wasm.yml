@@ -61,6 +61,10 @@ jobs:
 
       - name: Configure
         run: make configure_ci
+        env:
+          # Pin the engine the places-parquet demo kernel (duckdb-wasm 1.32.0
+          # npm) embeds, so the wasm extension ABI matches for side-loading.
+          TARGET_DUCKDB_VERSION: v1.4.3
 
       - name: Build ${{ matrix.platform }}
         env:
