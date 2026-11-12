@@ -63,6 +63,12 @@ jobs:
         run: make configure_ci
 
       - name: Build ${{ matrix.platform }}
+        env:
+          # zstd-sys C objects are linked into an emscripten SIDE_MODULE,
+          # which requires PIC relocations (via the GOT). Without -fPIC the
+          # objects compile non-PIC and wasm-ld rejects them.
+          CFLAGS_wasm32_unknown_emscripten: "-fPIC"
+          CXXFLAGS_wasm32_unknown_emscripten: "-fPIC"
         run: make ${{ matrix.platform }}
 
       - name: Verify artifact
