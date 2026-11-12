@@ -1,0 +1,79 @@
+name: Wasm build
+
+# Builds the extension as DuckDB-Wasm loadable packages (wasm_mvp + wasm_eh)
+# using the same extension-ci-tools pipeline the community CI uses, so the
+# artifacts can be self-hosted and loaded by the stock DuckDB-Wasm engine via
+# `SET custom_extension_repository` + INSTALL/LOAD (emscripten dlopen).
+#
+# Toolchain pins mirror duckdb/extension-ci-tools' wasm job:
+#   - emsdk 6.0.9 (engine + extension must share the emcc version)
+#   - rust target wasm32-unknown-emscripten
+#   - make configure_ci && make wasm_eh / wasm_mvp
+#
+# The wasm job in community CI has no test target; artifacts are verified by
+# size/magic only here. Functional testing happens in the places-parquet demo.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Makefile'
+      - 'extension_config.cmake'
+      - '.github/workflows/wasm.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wasm:
+    name: wasm (${{ matrix.platform }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [wasm_eh, wasm_mvp]
+    env:
+      DUCKDB_PLATFORM: ${{ matrix.platform }}
+      EXTENSION_NAME: tantivy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-emscripten
+
+      - name: Setup Emscripten
+        uses: emscripten-core/setup-emsdk@v7
+        with:
+          version: '6.0.9'
+
+      - name: Configure
+        run: make configure_ci
+
+      - name: Build ${{ matrix.platform }}
+        run: make ${{ matrix.platform }}
+
+      - name: Verify artifact
+        run: |
+          ART=build/${{ matrix.platform }}/extension/tantivy/tantivy.duckdb_extension.wasm
+          ls -la "$(dirname "$ART")"
+          test -f "$ART"
+          head -c 4 "$ART" | od -An -tx1 | grep -q "00 61 73 6d"  # \0asm magic
+
+      - name: Upload to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/${{ matrix.platform }}/extension/tantivy/tantivy.duckdb_extension.wasm

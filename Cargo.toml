@@ -17,6 +17,15 @@ crate-type = ["cdylib"]
 name = "append_metadata"
 path = "src-bin/append_metadata/main.rs"
 
+# Wasm (emscripten side-module) build: extension-ci-tools' rust.Makefile builds
+# wasm platforms as `cargo build --example tantivy` and expects a staticlib
+# (libtantivy.a) — crate-type cannot be selected per target, so the example
+# remaps the lib crate (src/wasm_lib.rs). Mirrors duckdb-html-readability.
+[[example]]
+name = "tantivy"
+path = "src/wasm_lib.rs"
+crate-type = ["staticlib"]
+
 [dependencies]
 # tantivy — the Rust full-text search engine (MIT). Pinned to the 0.24 line: its
 # MSRV is under rust-version and it builds cleanly there; 0.25/0.26 bump
