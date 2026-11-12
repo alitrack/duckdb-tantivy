@@ -692,7 +692,7 @@ pub fn estimate_search(idx: &PersistentIndex, query: &str) -> Result<Estimate> {
     };
 
     let mut postings_bytes: u64 = 0;
-    let mut have_bytes = true;
+    let mut positions_bytes: u64 = 0;
     let mut max_candidates: u64 = 0;
     let mut missing_terms: usize = 0;
 
@@ -713,11 +713,12 @@ pub fn estimate_search(idx: &PersistentIndex, query: &str) -> Result<Estimate> {
             let term = Term::from_field_text(idx.body_field, t);
             if let Ok(Some(info)) = inv.get_term_info(&term) {
                 max_candidates += info.doc_freq as u64;
-                // Per-term decoded size is not exposed by tantivy 0.24's
-                // public API; approximate with doc_freq × 8 bytes (DocId +
-                // relaxed score lower bound) and mark the confidence down.
-                postings_bytes += info.doc_freq as u64 * 8;
-                have_bytes = false;
+                // EXACT bytes: TermInfo exposes the posting-list byte range in
+                // the .idx file AND the positions byte range in the .pos file
+                // (the index was built WithFreqsAndPositions, so a search
+                // decodes both). No approximation — confidence stays high.
+                postings_bytes += info.postings_range.len() as u64;
+                positions_bytes += info.positions_range.len() as u64;
             }
         }
     }
@@ -727,14 +728,9 @@ pub fn estimate_search(idx: &PersistentIndex, query: &str) -> Result<Estimate> {
             "{missing_terms} term-segment pairs absent (AND short-circuits; estimate assumes present pairs)"
         ));
     }
-    if have_bytes {
-        // Public API path with exact byte sizes (future tantivy).
-    } else {
-        notes.push(
-            "postings bytes = doc_freq × 8 approximation (tantivy 0.24 exposes no per-term byte size)".into(),
-        );
-        confidence = Confidence::Medium;
-    }
+    // postings + positions are both decoded by a WithFreqsAndPositions search;
+    // report the exact combined byte cost.
+    postings_bytes += positions_bytes;
     if max_candidates > num_docs {
         notes.push("max candidates exceeds num_docs (terms co-occur); conjunction prunes further".into());
     }
