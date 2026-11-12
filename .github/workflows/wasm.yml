@@ -57,7 +57,7 @@ jobs:
       - name: Setup Emscripten
         uses: emscripten-core/setup-emsdk@v7
         with:
-          version: '6.0.9'
+          version: 'sdk-6.0.9-64bit'
 
       - name: Configure
         run: make configure_ci
