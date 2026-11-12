@@ -35,7 +35,10 @@ use std::sync::{Arc, OnceLock};
 
 use jieba_rs::Jieba;
 use tantivy::collector::TopDocs;
+#[cfg(not(target_arch = "wasm32"))]
 use tantivy::directory::MmapDirectory;
+#[cfg(target_arch = "wasm32")]
+use tantivy::directory::RamDirectory;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED};
 use tantivy::Term;
@@ -1012,6 +1015,12 @@ pub fn create_persistent(
         ))
     })?;
 
+    #[cfg(target_arch = "wasm32")]
+    let mmap = {
+        let _ = &dir; // path is meaningless in wasm; index lives in RAM
+        RamDirectory::create()
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     let mmap = MmapDirectory::open(dir).map_err(|e| {
         SearchError::Internal(format!(
             "cannot mmap index directory '{}': {e}",
@@ -1095,6 +1104,22 @@ pub fn open_persistent(name: &str, dir: &Path) -> Result<PersistentIndex> {
             "invalid index name '{name}' (expected a single segment like 'my_index')"
         )));
     }
+    // No filesystem on wasm32: persistent named indexes are a native-only
+    // feature; wasm callers get a clear error instead of a panic.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (name, dir);
+        return Err(SearchError::Internal(
+            "persistent on-disk indexes are not available in wasm builds; \
+             create an in-RAM index with tantivy_create_index (no path) instead"
+                .to_string(),
+        ));
+    }
+    #[cfg(target_arch = "wasm32")]
+    let index: Index = {
+        unreachable!("rejected above on wasm32")
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     let index = Index::open_in_dir(dir).map_err(|e| {
         SearchError::Internal(format!(
             "no tantivy index found at '{}': {e}",
@@ -1667,6 +1692,7 @@ mod tests {
         let dir = tmp_dir("foreign");
         let mut sb = Schema::builder();
         let f = sb.add_text_field("body", TextOptions::default());
+        #[cfg_attr(target_arch = "wasm32", allow(unused))]
         let index =
             Index::open_or_create(MmapDirectory::open(&dir).unwrap(), sb.build()).unwrap();
         let mut writer = index.writer(WRITER_HEAP_BYTES).unwrap();
