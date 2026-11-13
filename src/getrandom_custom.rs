@@ -44,7 +44,7 @@ mod imp {
         use std::io::Write;
 
         if dest.is_null() {
-            return Err(getrandom::Error::new_stdio());
+            return Err(getrandom::Error::new_custom(1));
         }
         // SAFETY: caller (getrandom) guarantees `dest` is valid for `len` writes.
         let buf = unsafe { std::slice::from_raw_parts_mut(dest, len) };
