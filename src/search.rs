@@ -1094,6 +1094,8 @@ pub fn create_persistent(
             dir.display()
         ))
     })?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     index.tokenizers().register(ANALYZER, analyzer_for(&l));
 
     let mut writer = index
@@ -1142,6 +1144,7 @@ pub fn create_persistent(
         language: lang_id(&l).to_string(),
         num_docs,
     })
+    }
 }
 
 /// Reopen an existing persistent index from `dir` (read-only) and return a
