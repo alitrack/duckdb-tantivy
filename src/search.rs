@@ -1015,46 +1015,57 @@ pub fn create_persistent(
         ))
     })?;
 
+    // Same schema shape as `bm25_search`: a stored i64 id + an analyzed body.
+    // Built unconditionally (both targets read id_field/body_field below).
+    let mut sb = Schema::builder();
+    let id_field = sb.add_i64_field("id", STORED);
+    let text_opts = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(ANALYZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    );
+    let body_field = sb.add_text_field("body", text_opts);
+    let schema = sb.build();
+
     #[cfg(target_arch = "wasm32")]
-    let index: Index = {
+    {
         // No threads on wasm32 (single-threaded emscripten side module): the
         // regular IndexWriter needs a segment-updater thread pool and the
         // default reader policy needs a watcher thread. Use the threadless
         // single-segment writer and a manual-reload reader instead.
         let index = Index::create_in_ram(schema);
         index.tokenizers().register(ANALYZER, analyzer_for(&l));
-        let mut writer = tantivy::SingleSegmentIndexWriter::new(
-            index,
-            WRITER_HEAP_BYTES,
-        )
-        .map_err(|e| SearchError::Internal(e.to_string()))?;
+        let mut writer =
+            tantivy::SingleSegmentIndexWriter::new(index, WRITER_HEAP_BYTES)
+                .map_err(|e| SearchError::Internal(e.to_string()))?;
         for d in docs {
             let text = nfc(&d.text);
             writer
                 .add_document(doc!(id_field => d.id, body_field => text.as_str()))
                 .map_err(|e| SearchError::Internal(e.to_string()))?;
         }
-        writer.finalize().map_err(|e| SearchError::Internal(e.to_string()))?
-    };
-    #[cfg(target_arch = "wasm32")]
-    let reader: IndexReader = index
-        .reader_builder()
-        .reload_policy(tantivy::ReloadPolicy::Manual)
-        .try_into()
-        .map_err(|e: tantivy::TantivyError| SearchError::Internal(e.to_string()))?;
-    #[cfg(target_arch = "wasm32")]
-    {
-        // provenance sidecar lives in the RAM directory
+        let index = writer
+            .finalize()
+            .map_err(|e| SearchError::Internal(e.to_string()))?;
+
+        let reader: IndexReader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e: tantivy::TantivyError| SearchError::Internal(e.to_string()))?;
+
+        // Provenance sidecar lives in the RAM directory (no fs on wasm32).
         let meta = format!(
             "{{\"name\":{},\"language\":{}}}",
             serde_json::to_string(name).map_err(|e| SearchError::Internal(e.to_string()))?,
             serde_json::to_string(lang_id(&l)).map_err(|e| SearchError::Internal(e.to_string()))?
         );
+        use tantivy::directory::Directory;
         index
             .directory()
             .atomic_write(std::path::Path::new(INDEX_META_FILE), meta.as_bytes())
             .map_err(|e| SearchError::Internal(e.to_string()))?;
-        let _ = dir;
+
         let searcher = reader.searcher();
         let num_docs = searcher.num_docs() as usize;
         return Ok(PersistentIndex {
@@ -1075,16 +1086,6 @@ pub fn create_persistent(
             dir.display()
         ))
     })?;
-    // Same schema shape as `bm25_search`: a stored i64 id + an analyzed body.
-    let mut sb = Schema::builder();
-    let id_field = sb.add_i64_field("id", STORED);
-    let text_opts = TextOptions::default().set_indexing_options(
-        TextFieldIndexing::default()
-            .set_tokenizer(ANALYZER)
-            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-    );
-    let body_field = sb.add_text_field("body", text_opts);
-    let schema = sb.build();
 
     let index = Index::open_or_create(mmap, schema).map_err(|e| {
         SearchError::Internal(format!(
