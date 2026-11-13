@@ -1037,22 +1037,22 @@ pub fn create_persistent(
         index.tokenizers().register(ANALYZER, analyzer_for(&l));
         let mut writer =
             tantivy::SingleSegmentIndexWriter::new(index, WRITER_HEAP_BYTES)
-                .map_err(|e| SearchError::Internal(e.to_string()))?;
+                .map_err(|e| SearchError::Internal(format!("[wasm-step writer-new] {e}")))?;
         for d in docs {
             let text = nfc(&d.text);
             writer
                 .add_document(doc!(id_field => d.id, body_field => text.as_str()))
-                .map_err(|e| SearchError::Internal(e.to_string()))?;
+                .map_err(|e| SearchError::Internal(format!("[wasm-step add-doc] {e}")))?;
         }
         let index = writer
             .finalize()
-            .map_err(|e| SearchError::Internal(e.to_string()))?;
+            .map_err(|e| SearchError::Internal(format!("[wasm-step finalize] {e}")))?;
 
         let reader: IndexReader = index
             .reader_builder()
             .reload_policy(tantivy::ReloadPolicy::Manual)
             .try_into()
-            .map_err(|e: tantivy::TantivyError| SearchError::Internal(e.to_string()))?;
+            .map_err(|e: tantivy::TantivyError| SearchError::Internal(format!("[wasm-step reader] {e}")))?;
 
         // Provenance sidecar lives in the RAM directory (no fs on wasm32).
         let meta = format!(
