@@ -1087,6 +1087,7 @@ pub fn create_persistent(
         ))
     })?;
 
+    #[cfg(not(target_arch = "wasm32"))]
     let index = Index::open_or_create(mmap, schema).map_err(|e| {
         SearchError::Internal(format!(
             "cannot open index in '{}': {e}",
