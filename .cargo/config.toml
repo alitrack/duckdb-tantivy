@@ -1,0 +1,13 @@
+# wasm32-unknown-emscripten build flags for this crate only.
+#
+# getrandom 0.4's default emscripten backend calls getentropy(2), which does
+# not exist inside a DuckDB wasm side module (emcc -sSIDE_MODULE=2) — every
+# call fails with EAGAIN (os error 6), which breaks uuid v4 → tantivy
+# SegmentId generation at index-build time.
+#
+# The "custom" backend is getrandom's official extension point: we export
+# `__getrandom_v03_custom` from this crate (see src/getrandom_custom.rs) and
+# back it with a deterministic xorshift PRNG — segment ids only need
+# uniqueness within one engine process, not cryptographic randomness.
+[target.wasm32-unknown-emscripten]
+rustflags = ['--cfg', 'getrandom_backend="custom"']

@@ -24,6 +24,8 @@ use quack_rs::types::{LogicalType, TypeId};
 use quack_rs::vector::{ListBuilder, VectorReader, VectorWriter};
 
 mod search;
+#[cfg(target_arch = "wasm32")]
+mod getrandom_custom;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Session connection — v0.1 single-database semantics, made loud & safe

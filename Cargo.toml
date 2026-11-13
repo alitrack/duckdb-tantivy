@@ -69,8 +69,10 @@ tantivy = { version = "=0.24.2", default-features = false, features = ["mmap", "
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tantivy = { version = "=0.24.2", default-features = false, features = ["stopwords", "lz4-compression"] }
-getrandom = { version = "0.2", features = ["js"] }
-uuid = { version = "1", features = ["js"] }
+# Only to export `__getrandom_v03_custom` (getrandom 0.4 custom backend —
+# uuid v4 → tantivy SegmentId); see src/getrandom_custom.rs. Must match the
+# getrandom major that uuid pulls so the symbol signature resolves.
+getrandom = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 # SQL-level integration tests: InMemoryDb compiles a real bundled DuckDB so the
