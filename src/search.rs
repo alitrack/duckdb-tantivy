@@ -1033,7 +1033,21 @@ pub fn create_persistent(
         // regular IndexWriter needs a segment-updater thread pool and the
         // default reader policy needs a watcher thread. Use the threadless
         // single-segment writer and a manual-reload reader instead.
-        let index = Index::create_in_ram(schema);
+        // Single-threaded wasm: IndexSettings defaults spawn a docstore
+        // compressor thread (thread::Builder::spawn fails with EAGAIN
+        // "Resource temporarily unavailable (os error 6)" on wasm32), so
+        // build via IndexBuilder with dedicated-thread compression off.
+        let index = {
+            let settings = tantivy::IndexSettings {
+                docstore_compress_dedicated_thread: false,
+                ..Default::default()
+            };
+            tantivy::IndexBuilder::new()
+                .schema(schema)
+                .settings(settings)
+                .create_in_ram()
+                .map_err(|e| SearchError::Internal(format!("[wasm-step create-in-ram] {e}")))?
+        };
         index.tokenizers().register(ANALYZER, analyzer_for(&l));
         let mut writer =
             tantivy::SingleSegmentIndexWriter::new(index, WRITER_HEAP_BYTES)
