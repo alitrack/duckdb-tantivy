@@ -1016,10 +1016,58 @@ pub fn create_persistent(
     })?;
 
     #[cfg(target_arch = "wasm32")]
-    let mmap = {
-        let _ = &dir; // path is meaningless in wasm; index lives in RAM
-        RamDirectory::create()
+    let index: Index = {
+        // No threads on wasm32 (single-threaded emscripten side module): the
+        // regular IndexWriter needs a segment-updater thread pool and the
+        // default reader policy needs a watcher thread. Use the threadless
+        // single-segment writer and a manual-reload reader instead.
+        let index = Index::create_in_ram(schema);
+        index.tokenizers().register(ANALYZER, analyzer_for(&l));
+        let mut writer = tantivy::SingleSegmentIndexWriter::new(
+            index,
+            WRITER_HEAP_BYTES,
+        )
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+        for d in docs {
+            let text = nfc(&d.text);
+            writer
+                .add_document(doc!(id_field => d.id, body_field => text.as_str()))
+                .map_err(|e| SearchError::Internal(e.to_string()))?;
+        }
+        writer.finalize().map_err(|e| SearchError::Internal(e.to_string()))?
     };
+    #[cfg(target_arch = "wasm32")]
+    let reader: IndexReader = index
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::Manual)
+        .try_into()
+        .map_err(|e: tantivy::TantivyError| SearchError::Internal(e.to_string()))?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        // provenance sidecar lives in the RAM directory
+        let meta = format!(
+            "{{\"name\":{},\"language\":{}}}",
+            serde_json::to_string(name).map_err(|e| SearchError::Internal(e.to_string()))?,
+            serde_json::to_string(lang_id(&l)).map_err(|e| SearchError::Internal(e.to_string()))?
+        );
+        index
+            .directory()
+            .atomic_write(std::path::Path::new(INDEX_META_FILE), meta.as_bytes())
+            .map_err(|e| SearchError::Internal(e.to_string()))?;
+        let _ = dir;
+        let searcher = reader.searcher();
+        let num_docs = searcher.num_docs() as usize;
+        return Ok(PersistentIndex {
+            name: name.to_string(),
+            path: dir.to_string_lossy().into_owned(),
+            reader,
+            searcher_handle: searcher,
+            id_field,
+            body_field,
+            language: lang_id(&l).to_string(),
+            num_docs,
+        });
+    }
     #[cfg(not(target_arch = "wasm32"))]
     let mmap = MmapDirectory::open(dir).map_err(|e| {
         SearchError::Internal(format!(
