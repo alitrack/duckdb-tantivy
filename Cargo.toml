@@ -35,6 +35,9 @@ crate-type = ["staticlib"]
 tantivy = { version = "=0.24.2", default-features = false }
 
 serde_json = "1"
+# turbovec — same crate duckdb_turbovec uses; lets us load its on-disk
+# IdMapIndex (.tv files) directly for the vector half of RRF hybrid search
+turbovec = "1.1"
 # jieba-rs — Chinese word segmentation (MIT). Pinned to the 0.7 line per the
 # feature design: 0.7.x's `cut()` API is stable, embeds the dictionary (no
 # file IO), and is Send+Sync (wrappable in Arc for tantivy's shared

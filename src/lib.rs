@@ -1214,6 +1214,226 @@ quack_rs::table_scan_callback!(stats_scan, |info, output| {
 // scan  : emit the hits in batches (identical shape to bm25_search).
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─── RRF hybrid: fuse tantivy BM25 with a turbovec IVF vector index ────────
+// Reciprocal Rank Fusion: score(d) = Σ 1/(k + rank_i(d)), k=60 standard.
+// Both sides search the SAME corpus: doc ids must agree between the
+// tantivy index (id_column) and the turbovec index (external ids).
+// The vector half loads turbovec's own on-disk IdMapIndex (.tv) via the
+// same crates.io turbovec crate duckdb_turbovec uses — no format glue.
+
+struct RrfBind {
+    fts_name: String,
+    fts_query: String,
+    vec_dir: String,
+    vec_query: String, // JSON array of floats
+    k: i64,            // RRF k
+    limit: i64,
+    vec_fetch: i64,    // how deep to search the vector index
+}
+
+struct RrfState {
+    rows: Vec<(i64, f64, i64, i64, f64, f64)>, // id, rrf, fts_rank, vec_rank, fts_score, vec_score
+    next: usize,
+}
+
+fn parse_f32_json(s: &str) -> Result<Vec<f32>, String> {
+    let v: Vec<f64> = serde_json::from_str(s).map_err(|e| format!("bad vector JSON: {e}"))?;
+    if v.is_empty() {
+        return Err("vector JSON is empty".into());
+    }
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err("vector JSON contains non-finite values".into());
+    }
+    Ok(v.into_iter().map(|x| x as f32).collect())
+}
+
+quack_rs::table_bind_callback!(rrf_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let fts_name = bind_info.get_parameter_value(0).as_str().unwrap_or_default().to_string();
+        let fts_query = bind_info.get_parameter_value(1).as_str().unwrap_or_default().to_string();
+        let vec_dir = bind_info.get_parameter_value(2).as_str().unwrap_or_default().to_string();
+        let vec_query = bind_info.get_parameter_value(3).as_str().unwrap_or_default().to_string();
+        let k = bind_info.get_named_parameter_value("rrf_k").as_i64().unwrap_or(60);
+        let limit = bind_info.get_named_parameter_value("top_k").as_i64().unwrap_or(10);
+        let vec_fetch = bind_info.get_named_parameter_value("vec_fetch").as_i64().unwrap_or(50);
+
+        if !(1..=100_000).contains(&limit) {
+            bind_info.set_error("tantivy_rrf_hybrid: top_k must be between 1 and 100000");
+            return;
+        }
+        if k < 0 {
+            bind_info.set_error("tantivy_rrf_hybrid: rrf_k must be >= 0");
+            return;
+        }
+        if !(1..=100_000).contains(&vec_fetch) {
+            bind_info.set_error("tantivy_rrf_hybrid: vec_fetch must be between 1 and 100000");
+            return;
+        }
+        if !search::is_safe_index_name(&fts_name) {
+            bind_info.set_error("tantivy_rrf_hybrid: bad fts index name");
+            return;
+        }
+        if !registry_lock().contains_key(&fts_name) {
+            bind_info.set_error(&format!(
+                "tantivy_rrf_hybrid: no persistent index '{fts_name}' is registered"
+            ));
+            return;
+        }
+        if vec_dir.trim().is_empty() {
+            bind_info.set_error("tantivy_rrf_hybrid: vec_dir (turbovec IVF output dir) is required");
+            return;
+        }
+        if parse_f32_json(&vec_query).is_err() {
+            bind_info.set_error("tantivy_rrf_hybrid: vec_query must be a JSON array of numbers");
+            return;
+        }
+
+        bind_info
+            .add_result_column("doc_id", TypeId::BigInt)
+            .add_result_column("rrf_score", TypeId::Double)
+            .add_result_column("fts_rank", TypeId::BigInt)
+            .add_result_column("vec_rank", TypeId::BigInt)
+            .add_result_column("fts_score", TypeId::Double)
+            .add_result_column("vec_score", TypeId::Double)
+            .set_cardinality(limit as u64, false);
+        FfiBindData::<RrfBind>::set(
+            info,
+            RrfBind { fts_name, fts_query, vec_dir, vec_query, k, limit, vec_fetch },
+        );
+    }
+});
+
+quack_rs::table_init_callback!(rrf_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+
+        let Some(bind) = FfiBindData::<RrfBind>::get_from_init(info) else {
+            FfiInitData::<RrfState>::set(info, RrfState { rows: Vec::new(), next: 0 });
+            return;
+        };
+
+        // ── FTS half: reuse the persistent-search path (BM25, no boosts) ──
+        let fts_hits = {
+            match registry_lock().get(&bind.fts_name).cloned() {
+                Some(idx) => {
+                    match search::persistent_search_boosted(
+                        &idx, &bind.fts_query, bind.limit.max(bind.vec_fetch) as usize, &Vec::new(),
+                    ) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            init_info.set_error(&format!("tantivy_rrf_hybrid (fts): {e}"));
+                            FfiInitData::<RrfState>::set(info, RrfState { rows: Vec::new(), next: 0 });
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    init_info.set_error("tantivy_rrf_hybrid: fts index vanished");
+                    FfiInitData::<RrfState>::set(info, RrfState { rows: Vec::new(), next: 0 });
+                    return;
+                }
+            }
+        };
+
+        // ── vector half: turbovec IdMapIndex from .tv in vec_dir ──
+        let query_vec = match parse_f32_json(&bind.vec_query) {
+            Ok(v) => v,
+            Err(e) => {
+                init_info.set_error(&format!("tantivy_rrf_hybrid: {e}"));
+                FfiInitData::<RrfState>::set(info, RrfState { rows: Vec::new(), next: 0 });
+                return;
+            }
+        };
+        let tv_path = std::path::Path::new(&bind.vec_dir).join("index.tv");
+        let idx = match turbovec::IdMapIndex::load(&tv_path) {
+            Ok(i) => i,
+            Err(e) => {
+                init_info.set_error(&format!(
+                    "tantivy_rrf_hybrid: cannot load turbovec index at {}: {e}",
+                    tv_path.display()
+                ));
+                FfiInitData::<RrfState>::set(info, RrfState { rows: Vec::new(), next: 0 });
+                return;
+            }
+        };
+        if idx.dim() != query_vec.len() {
+            init_info.set_error(&format!(
+                "tantivy_rrf_hybrid: query dim {} != index dim {}",
+                query_vec.len(),
+                idx.dim()
+            ));
+            FfiInitData::<RrfState>::set(info, RrfState { rows: Vec::new(), next: 0 });
+            return;
+        }
+        let fetch = (bind.vec_fetch as usize).min(idx.len());
+        let (vec_scores, vec_ids) = idx.search(&query_vec, fetch);
+
+        // ── RRF fuse ──
+        use std::collections::HashMap;
+        let kk = bind.k as f64;
+        let mut acc: HashMap<i64, (f64, i64, i64, i64, f64, f64)> = HashMap::new();
+        for (rank, hit) in fts_hits.iter().enumerate() {
+            let e = acc.entry(hit.doc_id).or_insert((0.0, 0, 0, 0, 0.0, 0.0));
+            e.0 += 1.0 / (kk + rank as f64 + 1.0);
+            e.2 = (rank + 1) as i64;
+            e.4 = hit.score;
+        }
+        for qi in 0..idx_search_rows(&vec_ids, fetch) {
+            let id = vec_ids[qi] as i64;
+            let sc = vec_scores[qi] as f64;
+            let rank = (vec_ids[..=qi].iter().rposition(|&x| x as i64 == id).unwrap_or(qi)) as i64;
+            let e = acc.entry(id).or_insert((0.0, 0, 0, 0, 0.0, 0.0));
+            e.0 += 1.0 / (kk + rank as f64 + 1.0);
+            e.3 = rank + 1;
+            e.5 = sc;
+        }
+        let mut rows: Vec<_> = acc.into_iter().map(|(id, v)| (id, v.0, v.2, v.3, v.4, v.5)).collect();
+        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+        rows.truncate(bind.limit as usize);
+        FfiInitData::<RrfState>::set(info, RrfState { rows, next: 0 });
+    }
+});
+
+/// IdMapIndex::search returns (scores, ids) row-major for ONE query as a flat
+/// slice of len = clamped k; helper to get the effective row count.
+fn idx_search_rows(ids: &[u64], fetch: usize) -> usize {
+    ids.len().min(fetch)
+}
+
+quack_rs::table_scan_callback!(rrf_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<RrfState>::get_mut(info) else {
+            chunk.set_size(0);
+            return;
+        };
+        if state.next >= state.rows.len() {
+            chunk.set_size(0);
+            return;
+        }
+        let batch = (state.rows.len() - state.next).min(duckdb_vector_size() as usize);
+        let mut w0 = chunk.writer(0);
+        let mut w1 = chunk.writer(1);
+        let mut w2 = chunk.writer(2);
+        let mut w3 = chunk.writer(3);
+        let mut w4 = chunk.writer(4);
+        let mut w5 = chunk.writer(5);
+        for i in 0..batch {
+            let r = &state.rows[state.next + i];
+            w0.write_i64(i, r.0);
+            w1.write_f64(i, r.1);
+            w2.write_i64(i, r.2);
+            w3.write_i64(i, r.3);
+            w4.write_f64(i, r.4);
+            w5.write_f64(i, r.5);
+        }
+        state.next += batch;
+        chunk.set_size(batch);
+    }
+});
+
 struct PSearchBind {
     name: String,
     query: String,
@@ -2521,6 +2741,25 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
 
     // tantivy_list() → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
     // (snapshot of the process-global registry of persistent indexes)
+    // tantivy_rrf_hybrid(fts_name, fts_query, vec_dir, vec_query_json,
+    //                    [rrf_k := 60], [top_k := 10], [vec_fetch := 50])
+    //   → doc_id, rrf_score, fts_rank, vec_rank, fts_score, vec_score
+    // Reciprocal Rank Fusion of tantivy BM25 + turbovec IVF vector search.
+    // vec_dir = the turboquant_build_ivf output dir (reads its index.tv).
+    con.register_table(
+        TableFunctionBuilder::new("tantivy_rrf_hybrid")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .named_param("rrf_k", TypeId::BigInt)
+            .named_param("top_k", TypeId::BigInt)
+            .named_param("vec_fetch", TypeId::BigInt)
+            .bind(rrf_bind)
+            .init(rrf_init)
+            .scan(rrf_scan),
+    )?;
+
     con.register_table(
         TableFunctionBuilder::new("tantivy_list")
             .bind(list_bind)
