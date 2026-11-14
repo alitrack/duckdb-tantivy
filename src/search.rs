@@ -47,6 +47,7 @@ use tantivy::tokenizer::{
     Token, TokenStream, Tokenizer,
 };
 use tantivy::{doc, Index, IndexReader, Searcher, TantivyDocument};
+use tantivy::snippet::SnippetGenerator;
 use unicode_normalization::UnicodeNormalization;
 
 /// NFC-normalize `s`. Both documents and queries are normalized with this before
@@ -1305,6 +1306,45 @@ pub fn persistent_search(idx: &PersistentIndex, query: &str, limit: usize) -> Re
     });
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Generate a highlighted snippet of `text` for `query`, using the corpus
+/// statistics (term doc-frequencies + the index's own tokenizer/stemmer) of
+/// the registered persistent index `idx`. The index supplies IDF-weighted
+/// term extraction and the language-correct analyzer (Snowball stem or
+/// jieba); the caller supplies the original text — typically joined back
+/// from the heap table, since persistent indexes do not store the body.
+///
+/// Output: the best fragment (~150 chars by default) with query terms
+/// wrapped in `[HIGHLIGHT]`/`[/HIGHLIGHT]` markers (NOT raw `<b>` HTML —
+/// the caller decides the rendering; HTML escaping stays the caller's job).
+/// Empty query → the empty string. No matching term in the text → the
+/// leading fragment, unhighlighted (tantivy's Snippet semantics).
+pub fn snippet(idx: &PersistentIndex, query: &str, text: &str) -> Result<String> {
+    check_text_len(query)?;
+    check_text_len(text)?;
+
+    let searcher = &idx.searcher_handle;
+
+    // Build a SnippetGenerator from the parsed query — same sanitize chain as
+    // persistent_search so highlighted terms == matched terms.
+    let mut parser = QueryParser::for_index(searcher.index(), vec![idx.body_field]);
+    parser.set_conjunction_by_default();
+    let parsed = if query.trim().is_empty() {
+        return Ok(String::new());
+    } else {
+        parser
+            .parse_query(&sanitize_query(&nfc(query)))
+            .map_err(|e| SearchError::BadQuery(e.to_string()))?
+    };
+
+    let mut generator = SnippetGenerator::create(searcher, &parsed, idx.body_field)
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+    generator.set_max_num_chars(150);
+
+    let mut snip = generator.snippet(&nfc(text));
+    snip.set_snippet_prefix_postfix("[HIGHLIGHT]", "[/HIGHLIGHT]");
+    Ok(snip.to_html())
 }
 
 #[cfg(test)]

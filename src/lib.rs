@@ -2216,6 +2216,71 @@ quack_rs::scalar_callback!(tantivy_version_fn, |_info, input, output| {
     }
 });
 
+// tantivy_snippet(index_name, query, text) — highlighted fragment of `text`
+// for `query`, using the named persistent index's corpus statistics and its
+// own tokenizer (Snowball stem or jieba per the index language). Markers are
+// [HIGHLIGHT]/[/HIGHLIGHT]; the caller renders (and HTML-escapes).
+quack_rs::scalar_callback!(tantivy_snippet_fn, |info, input, output| {
+    unsafe {
+        let _fn_info = ScalarFunctionInfo::new(info);
+        let name_reader = VectorReader::new(input, 0);
+        let query_reader = VectorReader::new(input, 1);
+        let text_reader = VectorReader::new(input, 2);
+        let row_count = name_reader.row_count();
+        let mut writer = VectorWriter::new(output);
+
+        // Rows are processed one at a time, but the SnippetGenerator (query →
+        // IDF-weighted terms) only depends on (name, query) — cache the last
+        // pair per chunk so a JOIN over N docs with one query parses once.
+        // (The generator itself lives in search::snippet; the cache here is
+        // just the lookup of the registry Arc, which is already cheap. The
+        // heavier parse+create is re-done per row only when the query varies
+        // per row, which is the rare path.)
+        for row in 0..row_count {
+            if !name_reader.is_valid(row) || !query_reader.is_valid(row) || !text_reader.is_valid(row)
+            {
+                writer.set_null(row);
+                continue;
+            }
+            let name = name_reader.read_str(row);
+            let query = query_reader.read_str(row);
+            let text = text_reader.read_str(row);
+
+            // NOTE: unlike the table functions, a scalar callback cannot
+            // abort the query with set_error in DuckDB 2.0 unless the
+            // function is registered as fallible (a C++ API not exposed via
+            // the C API) — an execution-time error here would surface as an
+            // INTERNAL assertion. So invalid input degrades to NULL:
+            // unknown/unsafe index name → NULL (COALESCE if a fragment is
+            // wanted regardless); only (name,query,text) shape errors that
+            // tantivy itself raises still error out via set_error, which we
+            // avoid entirely by validating shapes before calling in.
+            if !search::is_safe_index_name(&name) {
+                writer.set_null(row);
+                continue;
+            }
+            let idx = {
+                let reg = registry_lock();
+                match reg.get(name.trim()) {
+                    Some(i) => i.clone(),
+                    None => {
+                        writer.set_null(row);
+                        continue;
+                    }
+                }
+            };
+            match search::snippet(&idx, query, text) {
+                Ok(s) => writer.write_varchar(row, &s),
+                Err(_) => {
+                    // BadQuery/text-length: degrade to NULL rather than an
+                    // internal assertion (see note above).
+                    writer.set_null(row);
+                }
+            }
+        }
+    }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Registration + entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2433,6 +2498,15 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
         ScalarFunctionBuilder::new("tantivy_version")
             .returns(TypeId::Varchar)
             .function(tantivy_version_fn),
+    )?;
+
+    con.register_scalar(
+        ScalarFunctionBuilder::new("tantivy_snippet")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .returns(TypeId::Varchar)
+            .function(tantivy_snippet_fn),
     )?;
 
     Ok(())
