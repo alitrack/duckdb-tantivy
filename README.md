@@ -30,6 +30,7 @@ DuckDB C Extension API v1.2.0; artifacts are **unsigned** (load with
 | `stem(word, language)` | Snowball-stem a single word (`chinese`/`zh`: no stemmer, returns the original word unchanged — 中文无词干，恒等返回原词，不拆分、不插入空格) |
 | `bm25_score(doc, query)` / `bm25_score(doc, query, language)` | BM25 score of one doc against a query |
 | `tantivy_version()` | Version string of the embedded tantivy |
+| `tantivy_snippet(name, query, text)` | Highlighted ~150-char fragment of `text` for `query`, using the persistent index `name`'s corpus statistics and its own tokenizer (Snowball/jieba). Markers `[HIGHLIGHT]`/`[/HIGHLIGHT]`; no-match → leading fragment unhighlighted; unknown index / bad query / over-length → NULL (COALESCE if needed). `SELECT tantivy_snippet('idx','quantum computing', body) FROM docs JOIN tantivy_search_index('idx','quantum computing') USING (doc_id)` is the RAG pattern. |
 
 `top_k` is named `top_k` (not `limit`): `limit` is a reserved SQL keyword and
 cannot appear as a named-argument name.
