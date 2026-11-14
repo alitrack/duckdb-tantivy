@@ -504,7 +504,7 @@ quack_rs::table_init_callback!(bm25_init, |info| {
                                     id
                                 }
                             };
-                            docs.push(search::Document { id, text });
+                            docs.push(search::Document::new(id, text));
                         }
                     }
                     Ok(None) => break,
@@ -588,6 +588,7 @@ struct CreateBind {
     text_column: String,
     language: String,
     path: String,
+    extra_fields: Vec<String>,
 }
 
 struct CreateState {
@@ -622,6 +623,28 @@ quack_rs::table_bind_callback!(create_bind, |info| {
             _ => String::new(),
         };
 
+        // V3 multi-field: extra_fields := 'title, abstract' — comma-separated
+        // column names, each indexed as its own tantivy text field.
+        let extra_fields: Vec<String> = match bind_info
+            .get_named_parameter_value("extra_fields")
+            .as_str()
+        {
+            Ok(x) if !x.trim().is_empty() => x
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        };
+        for c in &extra_fields {
+            if !is_safe_identifier(c) {
+                bind_info.set_error(&format!(
+                    "tantivy_create_index: extra_fields entry '{c}' must be an identifier (e.g. 'title')"
+                ));
+                return;
+            }
+        }
+
         if !search::is_safe_index_name(&name) {
             bind_info.set_error(
                 "tantivy_create_index: name must be a single identifier segment like 'my_index' or 'my-index'",
@@ -649,12 +672,17 @@ quack_rs::table_bind_callback!(create_bind, |info| {
         }
 
         // Probe table + columns on the session connection (fail early and
-        // name the problem) — the same probe shape as bm25_search.
+        // name the problem) — the same probe shape as bm25_search. V3 extra
+        // fields are probed as VARCHAR casts too.
+        let extra_sel: String = extra_fields
+            .iter()
+            .map(|c| format!(", {c}::VARCHAR"))
+            .collect();
         let probe = if id_column.is_empty() {
-            format!("SELECT {text_column}::VARCHAR FROM {table} LIMIT 0")
+            format!("SELECT {text_column}::VARCHAR{extra_sel} FROM {table} LIMIT 0")
         } else {
             format!(
-                "SELECT {id_column}::BIGINT, {text_column}::VARCHAR FROM {table} LIMIT 0"
+                "SELECT {id_column}::BIGINT, {text_column}::VARCHAR{extra_sel} FROM {table} LIMIT 0"
             )
         };
         match session() {
@@ -687,6 +715,7 @@ quack_rs::table_bind_callback!(create_bind, |info| {
                 text_column,
                 language,
                 path,
+                extra_fields,
             },
         );
     }
@@ -712,13 +741,21 @@ quack_rs::table_init_callback!(create_init, |info| {
         };
 
         let has_id = !bind.id_column.is_empty();
+        let extra_sel: String = bind
+            .extra_fields
+            .iter()
+            .map(|c| format!(", {}::VARCHAR", c))
+            .collect();
         let sql = if has_id {
             format!(
-                "SELECT {}::BIGINT AS id, {}::VARCHAR AS text FROM {}",
-                bind.id_column, bind.text_column, bind.table
+                "SELECT {}::BIGINT AS id, {}::VARCHAR AS text{} FROM {}",
+                bind.id_column, bind.text_column, extra_sel, bind.table
             )
         } else {
-            format!("SELECT {}::VARCHAR AS text FROM {}", bind.text_column, bind.table)
+            format!(
+                "SELECT {}::VARCHAR AS text{} FROM {}",
+                bind.text_column, extra_sel, bind.table
+            )
         };
 
         let mut docs: Vec<search::Document> = Vec::new();
@@ -901,7 +938,23 @@ quack_rs::table_init_callback!(create_init, |info| {
                                     id
                                 }
                             };
-                            docs.push(search::Document { id, text });
+                                                        // V3 extras: read each extra column (NULL → the
+                            // field is simply absent for this doc).
+                            let mut extras: Vec<(String, String)> = Vec::new();
+                            for (i, fname) in bind.extra_fields.iter().enumerate() {
+                                let er = unsafe { d.reader(if has_id { 2 + i } else { 1 + i }) };
+                                if unsafe { er.is_valid(row) } {
+                                    extras.push((
+                                        fname.clone(),
+                                        unsafe { er.read_str(row) }.to_string(),
+                                    ));
+                                }
+                            }
+                            docs.push(search::Document {
+                                id,
+                                text,
+                                extras,
+                            });
                         }
                     }
                     Ok(None) => break,
@@ -934,7 +987,13 @@ quack_rs::table_init_callback!(create_init, |info| {
         // not interleave wipe/write in the index directory.
         let _build_guard =
             CREATE_INDEX_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let idx = match search::create_persistent(&bind.name, &dir, &bind.language, &docs) {
+        let idx = match search::create_persistent_multifield(
+            &bind.name,
+            &dir,
+            &bind.language,
+            &docs,
+            &bind.extra_fields,
+        ) {
             Ok(i) => i,
             Err(e) => {
                 init_info.set_error(&format!("tantivy_create_index: {e}"));
@@ -1145,6 +1204,8 @@ struct PSearchBind {
     name: String,
     query: String,
     limit: i64,
+    /// V3 field boosts parsed at bind: (field_name, factor).
+    boosts: Vec<(String, f32)>,
 }
 
 struct PSearchState {
@@ -1172,6 +1233,39 @@ quack_rs::table_bind_callback!(psearch_bind, |info| {
             }
             None => 10,
         };
+
+        // V3 field boosts: boosts := 'title:2.0, abstract:1.5' — applied to
+        // the extra fields the index actually has.
+        let boosts: Vec<(String, f32)> = match bind_info
+            .get_named_parameter_value("boosts")
+            .as_str()
+        {
+            Ok(x) if !x.trim().is_empty() => x
+                .split(',')
+                .filter_map(|pair| {
+                    let pair = pair.trim();
+                    if pair.is_empty() {
+                        return None;
+                    }
+                    let (n, v) = pair.rsplit_once(':')?;
+                    let v: f32 = v.trim().parse().ok()?;
+                    if v.is_finite() && v >= 0.0 {
+                        Some((n.trim().to_string(), v))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (n, _) in &boosts {
+            if !is_safe_identifier(n) {
+                bind_info.set_error(&format!(
+                    "tantivy_search_index: boosts field '{n}' must be an identifier"
+                ));
+                return;
+            }
+        }
 
         if !search::is_safe_index_name(&name) {
             bind_info.set_error(
@@ -1201,6 +1295,7 @@ quack_rs::table_bind_callback!(psearch_bind, |info| {
                 name: name.trim().to_string(),
                 query,
                 limit,
+                boosts,
             },
         );
     }
@@ -1232,7 +1327,7 @@ quack_rs::table_init_callback!(psearch_init, |info| {
             }
         };
 
-        let hits = match search::persistent_search(&idx, &bind.query, bind.limit as usize) {
+        let hits = match search::persistent_search_boosted(&idx, &bind.query, bind.limit as usize, &bind.boosts) {
             Ok(h) => h,
             Err(e) => {
                 init_info.set_error(&format!("tantivy_search_index: {e}"));
@@ -2369,6 +2464,7 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .named_param("text_column", TypeId::Varchar)
             .named_param("language", TypeId::Varchar)
             .named_param("path", TypeId::Varchar)
+            .named_param("extra_fields", TypeId::Varchar)
             .bind(create_bind)
             .init(create_init)
             .scan(create_scan),
@@ -2381,6 +2477,7 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .param(TypeId::Varchar)
             .param(TypeId::Varchar)
             .named_param("top_k", TypeId::BigInt)
+            .named_param("boosts", TypeId::Varchar)
             .bind(psearch_bind)
             .init(psearch_init)
             .scan(psearch_scan),

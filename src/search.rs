@@ -385,11 +385,25 @@ pub struct Hit {
     pub score: f64,
 }
 
-/// One document to index: a caller id and its text body.
+/// One document to index: a caller id, its text body, and optional extra
+/// text fields (V3 multi-field indexes). `extras` maps field name → text;
+/// entries line up with the `extra_fields` list given at create time.
 #[derive(Debug, Clone)]
 pub struct Document {
     pub id: i64,
     pub text: String,
+    pub extras: Vec<(String, String)>,
+}
+
+impl Document {
+    /// V2-compatible constructor (no extra fields).
+    pub fn new(id: i64, text: String) -> Self {
+        Document {
+            id,
+            text,
+            extras: Vec::new(),
+        }
+    }
 }
 
 /// Parse the `docs_json` payload into a document list. Accepts either:
@@ -428,10 +442,7 @@ pub fn parse_docs(docs_json: &str) -> Result<Vec<Document>> {
         match item {
             serde_json::Value::String(s) => {
                 check_text_len(&s)?;
-                docs.push(Document {
-                    id: idx as i64,
-                    text: s,
-                });
+                docs.push(Document::new(idx as i64, s));
             }
             serde_json::Value::Object(map) => {
                 let id = match map.get("id") {
@@ -453,7 +464,7 @@ pub fn parse_docs(docs_json: &str) -> Result<Vec<Document>> {
                     }
                 };
                 check_text_len(&text)?;
-                docs.push(Document { id, text });
+                docs.push(Document::new(id, text));
             }
             _ => {
                 return Err(SearchError::BadDocsJson(format!(
@@ -570,10 +581,7 @@ pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> 
 /// corpus. Unknown language / bad query → error.
 pub fn bm25_score(doc_text: &str, query: &str, lang: &str) -> Result<f64> {
     check_text_len(doc_text)?;
-    let docs = [Document {
-        id: 0,
-        text: doc_text.to_string(),
-    }];
+    let docs = [Document::new(0, doc_text.to_string())];
     let hits = bm25_search(&docs, query, lang, 1)?;
     Ok(hits.first().map(|h| h.score).unwrap_or(0.0))
 }
@@ -887,6 +895,9 @@ pub struct PersistentIndex {
     pub id_field: Field,
     /// The analyzed text-body field.
     pub body_field: Field,
+    /// V3 extra text fields (name -> field handle), restored from the meta
+    /// sidecar on reopen. Empty for V2 indexes.
+    pub extra_fields: Vec<(String, Field)>,
     /// The resolved (alias-normalized) language id the index was built with,
     /// e.g. `"chinese"`.
     pub language: String,
@@ -990,6 +1001,40 @@ pub fn create_persistent(
     lang: &str,
     docs: &[Document],
 ) -> Result<PersistentIndex> {
+    create_persistent_multifield(name, dir, lang, docs, &[])
+}
+
+/// V3 multi-field create: `extra_fields` names additional text fields; each
+/// doc's `extras` entries are indexed under their field name (missing entries
+/// are simply absent from that doc). Field names must be safe identifiers and
+/// distinct from `id`/`body`. The field list is recorded in the meta sidecar
+/// so `open_persistent` can restore the query parser's field set.
+pub fn create_persistent_multifield(
+    name: &str,
+    dir: &Path,
+    lang: &str,
+    docs: &[Document],
+    extra_fields: &[String],
+) -> Result<PersistentIndex> {
+    // Validate extra-field names once, up front.
+    let mut seen = std::collections::HashSet::new();
+    for f in extra_fields {
+        let t = f.trim();
+        if t.is_empty() || !is_safe_index_name(t) {
+            return Err(SearchError::Internal(format!(
+                "extra field '{f}' must be a single identifier segment like 'title'"
+            )));
+        }
+        if t == "id" || t == "body" {
+            return Err(SearchError::Internal(format!(
+                "extra field '{t}' collides with the reserved fields id/body"
+            )));
+        }
+        if !seen.insert(t.to_string()) {
+            return Err(SearchError::Internal(format!("duplicate extra field '{t}'")));
+        }
+    }
+    let extra_fields: Vec<String> = extra_fields.iter().map(|f| f.trim().to_string()).collect();
     if !is_safe_index_name(name) {
         return Err(SearchError::Internal(format!(
             "invalid index name '{name}' (expected a single segment like 'my_index')"
@@ -1016,8 +1061,9 @@ pub fn create_persistent(
         ))
     })?;
 
-    // Same schema shape as `bm25_search`: a stored i64 id + an analyzed body.
-    // Built unconditionally (both targets read id_field/body_field below).
+    // Same schema shape as `bm25_search`: a stored i64 id + an analyzed body,
+    // plus one analyzed text field per V3 extra field. Built unconditionally
+    // (both targets read id_field/body_field below).
     let mut sb = Schema::builder();
     let id_field = sb.add_i64_field("id", STORED);
     let text_opts = TextOptions::default().set_indexing_options(
@@ -1025,7 +1071,11 @@ pub fn create_persistent(
             .set_tokenizer(ANALYZER)
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     );
-    let body_field = sb.add_text_field("body", text_opts);
+    let body_field = sb.add_text_field("body", text_opts.clone());
+    let mut extra_field_handles: Vec<(String, Field)> = Vec::new();
+    for f in &extra_fields {
+        extra_field_handles.push((f.clone(), sb.add_text_field(f, text_opts.clone())));
+    }
     let schema = sb.build();
 
     #[cfg(target_arch = "wasm32")]
@@ -1055,8 +1105,15 @@ pub fn create_persistent(
                 .map_err(|e| SearchError::Internal(format!("[wasm-step writer-new] {e}")))?;
         for d in docs {
             let text = nfc(&d.text);
+            let mut bd = doc!(id_field => d.id, body_field => text.as_str());
+            for (fname, f) in &extra_field_handles {
+                if let Some((_, v)) = d.extras.iter().find(|(k, _)| k == fname) {
+                    let vv = nfc(v);
+                    bd.add_field_value(*f, vv.as_str());
+                }
+            }
             writer
-                .add_document(doc!(id_field => d.id, body_field => text.as_str()))
+                .add_document(bd)
                 .map_err(|e| SearchError::Internal(format!("[wasm-step add-doc] {e}")))?;
         }
         let index = writer
@@ -1071,9 +1128,10 @@ pub fn create_persistent(
 
         // Provenance sidecar lives in the RAM directory (no fs on wasm32).
         let meta = format!(
-            "{{\"name\":{},\"language\":{}}}",
+            "{{\"name\":{},\"language\":{},\"extra_fields\":{}}}",
             serde_json::to_string(name).map_err(|e| SearchError::Internal(e.to_string()))?,
-            serde_json::to_string(lang_id(&l)).map_err(|e| SearchError::Internal(e.to_string()))?
+            serde_json::to_string(lang_id(&l)).map_err(|e| SearchError::Internal(e.to_string()))?,
+            serde_json::to_string(&extra_fields).map_err(|e| SearchError::Internal(e.to_string()))?
         );
         use tantivy::directory::Directory;
         index
@@ -1119,8 +1177,15 @@ pub fn create_persistent(
     for d in docs {
         // NFC before indexing (same contract as bm25_search).
         let text = nfc(&d.text);
+        let mut bd = doc!(id_field => d.id, body_field => text.as_str());
+        for (fname, f) in &extra_field_handles {
+            if let Some((_, v)) = d.extras.iter().find(|(k, _)| k == fname) {
+                let vv = nfc(v);
+                bd.add_field_value(*f, vv.as_str());
+            }
+        }
         writer
-            .add_document(doc!(id_field => d.id, body_field => text.as_str()))
+            .add_document(bd)
             .map_err(|e| SearchError::Internal(e.to_string()))?;
     }
     writer
@@ -1138,9 +1203,10 @@ pub fn create_persistent(
     // Provenance sidecar: a failure here fails the whole create (kept
     // symmetric with `open_persistent`, which requires the file).
     let meta = format!(
-        "{{\"name\":{},\"language\":{}}}",
+        "{{\"name\":{},\"language\":{},\"extra_fields\":{}}}",
         serde_json::to_string(name).map_err(|e| SearchError::Internal(e.to_string()))?,
-        serde_json::to_string(lang_id(&l)).map_err(|e| SearchError::Internal(e.to_string()))?
+        serde_json::to_string(lang_id(&l)).map_err(|e| SearchError::Internal(e.to_string()))?,
+        serde_json::to_string(&extra_fields).map_err(|e| SearchError::Internal(e.to_string()))?
     );
     std::fs::write(dir.join(INDEX_META_FILE), meta).map_err(|e| {
         SearchError::Internal(format!(
@@ -1156,6 +1222,7 @@ pub fn create_persistent(
         searcher_handle: searcher,
         id_field,
         body_field,
+        extra_fields: extra_field_handles,
         language: lang_id(&l).to_string(),
         num_docs,
     })
@@ -1224,6 +1291,18 @@ pub fn open_persistent(name: &str, dir: &Path) -> Result<PersistentIndex> {
     let l = resolve_language(&language)?;
     index.tokenizers().register(ANALYZER, analyzer_for(&l));
 
+    // V3: restore the extra-field handles recorded at create time (V2
+    // sidecars simply have no extra_fields key -> empty vec).
+    let extra_names: Vec<String> = meta
+        .get("extra_fields")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(std::string::ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let schema = index.schema();
     let id_field = schema.get_field("id").map_err(|e| {
         SearchError::Internal(format!(
@@ -1237,6 +1316,16 @@ pub fn open_persistent(name: &str, dir: &Path) -> Result<PersistentIndex> {
             dir.display()
         ))
     })?;
+    let mut extra_fields: Vec<(String, Field)> = Vec::new();
+    for n in &extra_names {
+        let f = schema.get_field(n).map_err(|e| {
+            SearchError::Internal(format!(
+                "index at '{}' meta lists extra field '{n}' but the schema lacks it ({e})",
+                dir.display()
+            ))
+        })?;
+        extra_fields.push((n.clone(), f));
+    }
 
     let reader = index
         .reader()
@@ -1251,6 +1340,7 @@ pub fn open_persistent(name: &str, dir: &Path) -> Result<PersistentIndex> {
         searcher_handle: searcher,
         id_field,
         body_field,
+        extra_fields,
         language,
         num_docs,
     })
@@ -1263,15 +1353,46 @@ pub fn open_persistent(name: &str, dir: &Path) -> Result<PersistentIndex> {
 /// bit-identical to an ephemeral `bm25_search` over the same corpus with the
 /// same parameters. Empty/blank query → no hits; malformed query →
 /// [`SearchError::BadQuery`].
-pub fn persistent_search(idx: &PersistentIndex, query: &str, limit: usize) -> Result<Vec<Hit>> {
+pub fn persistent_search(
+    idx: &PersistentIndex,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Hit>> {
+    persistent_search_boosted(idx, query, limit, &[])
+}
+
+/// V3 boosted search: `boosts` is a list of (field_name, factor) pairs; only
+/// fields present in the index's extra_fields take effect. See
+/// [`persistent_search`] for the base semantics.
+pub fn persistent_search_boosted(
+    idx: &PersistentIndex,
+    query: &str,
+    limit: usize,
+    boosts: &[(String, f32)],
+) -> Result<Vec<Hit>> {
     check_text_len(query)?;
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
 
     let searcher = &idx.searcher_handle;
-    let mut parser = QueryParser::for_index(searcher.index(), vec![idx.body_field]);
+    let mut fields: Vec<Field> = vec![idx.body_field];
+    fields.extend(idx.extra_fields.iter().map(|(_, f)| *f));
+    let mut parser = QueryParser::for_index(searcher.index(), fields);
     parser.set_conjunction_by_default(); // AND semantics: all terms must match.
+    // V3 field boosts: "title:2.0" up-weights the extra field `title` for this
+    // query only (tantivy multiplies the field's score contribution).
+    for (name, f) in &idx.extra_fields {
+        if let Some(b) = boosts
+            .iter()
+            .find(|(n, _)| n.trim() == name.as_str())
+            .map(|(_, v)| *v)
+        {
+            if b.is_finite() && b >= 0.0 {
+                parser.set_field_boost(*f, b);
+            }
+        }
+    }
     let parsed = parser
         .parse_query(&sanitize_query(&nfc(query)))
         .map_err(|e| SearchError::BadQuery(e.to_string()))?;
@@ -1353,22 +1474,10 @@ mod tests {
 
     fn corpus() -> Vec<Document> {
         vec![
-            Document {
-                id: 0,
-                text: "the cat sat on the warm mat".into(),
-            },
-            Document {
-                id: 1,
-                text: "a curious cat chased the laser dot".into(),
-            },
-            Document {
-                id: 2,
-                text: "the loyal dog barked at the mailman".into(),
-            },
-            Document {
-                id: 3,
-                text: "the stock market crashed and finance suffered".into(),
-            },
+            Document::new(0, "the cat sat on the warm mat".into()),
+            Document::new(1, "a curious cat chased the laser dot".into()),
+            Document::new(2, "the loyal dog barked at the mailman".into()),
+            Document::new(3, "the stock market crashed and finance suffered".into()),
         ]
     }
 
@@ -1429,10 +1538,7 @@ mod tests {
         // Before sanitization, "e-mail:" is a field reference and the parser
         // raises BadQuery; now the words search as plain text (AND semantics:
         // the doc must contain both "e-mail" and "archos" — it does).
-        let docs = vec![Document {
-            id: 0,
-            text: "Enter your e-mail: Archos has turned".into(),
-        }];
+        let docs = vec![Document::new(0, "Enter your e-mail: Archos has turned".into())];
         let hits = bm25_search(&docs, "Enter your e-mail: Archos", "english", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, 0);
@@ -1562,10 +1668,10 @@ mod tests {
     #[test]
     fn top_k_tie_at_cutoff_returns_smallest_doc_id() {
         let docs = vec![
-            Document { id: 9, text: "a cat".into() },
-            Document { id: 2, text: "a cat".into() },
-            Document { id: 5, text: "a cat".into() },
-            Document { id: 1, text: "a dog".into() },
+            Document::new(9, "a cat".into()),
+            Document::new(2, "a cat".into()),
+            Document::new(5, "a cat".into()),
+            Document::new(1, "a dog".into()),
         ];
         let hits = bm25_search(&docs, "cat", "english", 1).unwrap();
         assert_eq!(hits.len(), 1);
@@ -1586,7 +1692,7 @@ mod tests {
     /// word and must match each other after NFC normalization.
     #[test]
     fn precomposed_and_decomposed_unicode_match() {
-        let docs = vec![Document { id: 0, text: "caf\u{00E9} latte".into() }];
+        let docs = vec![Document::new(0, "caf\u{00E9} latte".into())];
         // Query with the decomposed form must still hit the precomposed doc.
         let hits = bm25_search(&docs, "caf\u{0065}\u{0301}", "english", 10).unwrap();
         assert_eq!(hits.len(), 1, "NFC must make both spellings match");
@@ -1641,11 +1747,11 @@ mod tests {
     #[test]
     fn bm25_search_chinese_corpus() {
         let docs = vec![
-            Document { id: 0, text: "苹果发布了新款手机".into() },
-            Document { id: 1, text: "华为的麒麟芯片很强大".into() },
-            Document { id: 2, text: "北京大学的计算机系招生".into() },
-            Document { id: 3, text: "今天天气很好适合出门运动".into() },
-            Document { id: 4, text: "苹果 苹果 股票 苹果".into() },
+            Document::new(0, "苹果发布了新款手机".into()),
+            Document::new(1, "华为的麒麟芯片很强大".into()),
+            Document::new(2, "北京大学的计算机系招生".into()),
+            Document::new(3, "今天天气很好适合出门运动".into()),
+            Document::new(4, "苹果 苹果 股票 苹果".into()),
         ];
         let hits = bm25_search(&docs, "苹果", "chinese", 10).unwrap();
         let ids: Vec<i64> = hits.iter().map(|h| h.doc_id).collect();
@@ -1724,10 +1830,10 @@ mod tests {
     #[test]
     fn persistent_search_tie_break_matches_contract() {
         let docs = vec![
-            Document { id: 9, text: "a cat".into() },
-            Document { id: 2, text: "a cat".into() },
-            Document { id: 5, text: "a cat".into() },
-            Document { id: 1, text: "a dog".into() },
+            Document::new(9, "a cat".into()),
+            Document::new(2, "a cat".into()),
+            Document::new(5, "a cat".into()),
+            Document::new(1, "a dog".into()),
         ];
         let dir = tmp_dir("tie");
         let idx = create_persistent("tie_idx", &dir, "english", &docs).unwrap();
@@ -1748,9 +1854,9 @@ mod tests {
     #[test]
     fn persistent_search_chinese_corpus() {
         let docs = vec![
-            Document { id: 0, text: "苹果发布了新款手机".into() },
-            Document { id: 1, text: "华为的麒麟芯片很强大".into() },
-            Document { id: 4, text: "苹果 苹果 股票 苹果".into() },
+            Document::new(0, "苹果发布了新款手机".into()),
+            Document::new(1, "华为的麒麟芯片很强大".into()),
+            Document::new(4, "苹果 苹果 股票 苹果".into()),
         ];
         let dir = tmp_dir("zh");
         let idx = create_persistent("zh_idx", &dir, "chinese", &docs).unwrap();
@@ -1769,10 +1875,10 @@ mod tests {
     #[test]
     fn create_persistent_rebuilds_wiped_directory() {
         let dir = tmp_dir("rebuild");
-        let docs1 = vec![Document { id: 1, text: "zebra".into() }];
+        let docs1 = vec![Document::new(1, "zebra".into())];
         create_persistent("rb", &dir, "english", &docs1).unwrap();
         // Second build with different content replaces (not appends) the first.
-        let docs2 = vec![Document { id: 2, text: "giraffe".into() }];
+        let docs2 = vec![Document::new(2, "giraffe".into())];
         let idx = create_persistent("rb", &dir, "english", &docs2).unwrap();
         assert_eq!(idx.num_docs, 1, "rebuild must not append to the old segment");
         assert!(persistent_search(&idx, "zebra", 10).unwrap().is_empty());
