@@ -5,3 +5,4 @@ configure/
 *.so
 *.dylib
 laneC_report.md
+.tantivy_index/
