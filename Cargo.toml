@@ -50,7 +50,7 @@ unicode-normalization = "0.1"
 # exactly (like tantivy) so the reviewed ABI-wrapper version can never float
 # under a caret requirement (the lockfile fixes it today, but a CI or local
 # `cargo update` would re-resolve it otherwise).
-quack-rs = "=0.18.0"
+quack-rs = { version = "=0.18.0", features = ["duckdb-1-5-4"] }
 # C extension API headers/symbols; the cdylib resolves them against the host
 # DuckDB process at LOAD time. Left as a caret so the committed Cargo.lock can
 # pin the exact resolved version (1.10506) without a manifest/lock mismatch;

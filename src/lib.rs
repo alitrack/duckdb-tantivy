@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use libduckdb_sys::{duckdb_data_chunk_get_size, duckdb_vector_size};
 use quack_rs::connection::{Connection, Registrar};
+use quack_rs::config_option::{ConfigOptionBuilder, ConfigOptionScope};
 use quack_rs::data_chunk::DataChunk;
 use quack_rs::error::ExtensionError;
 use quack_rs::query::OwnedConnection;
@@ -288,7 +289,8 @@ quack_rs::table_bind_callback!(bm25_bind, |info| {
         };
         let language = match bind_info.get_named_parameter_value("language").as_str() {
             Ok(s) if !s.trim().is_empty() => s,
-            _ => "english".to_string(),
+            _ => setting_str(&bind_info, "tantivy_default_language")
+                .unwrap_or_else(|| "english".to_string()),
         };
         // `top_k` must be within [1, 100_000]: below 1 is a semantic error and
         // above the cap tantivy's TopDocs allocation (2*limit) becomes a memory
@@ -601,6 +603,17 @@ struct CreateState {
     done: bool,
 }
 
+
+/// P1b SQL knob: read a session/global config option at bind time. Returns
+/// the SET value if the user set one (and it parses as UTF-8), else `None`.
+/// Unknown options (older DuckDB without registration, or RESET) fall back
+/// to the caller-provided default.
+fn setting_str(bind_info: &quack_rs::table::BindInfo, name: &str) -> Option<String> {
+    let ctx = unsafe { bind_info.get_client_context() };
+    ctx.config_option(std::ffi::CString::new(name).ok()?.as_c_str())
+        .filter(|v| !v.trim().is_empty())
+}
+
 quack_rs::table_bind_callback!(create_bind, |info| {
     unsafe {
         let bind_info = BindInfo::new(info);
@@ -616,7 +629,8 @@ quack_rs::table_bind_callback!(create_bind, |info| {
         };
         let language = match bind_info.get_named_parameter_value("language").as_str() {
             Ok(s) if !s.trim().is_empty() => s,
-            _ => "english".to_string(),
+            _ => setting_str(&bind_info, "tantivy_default_language")
+                .unwrap_or_else(|| "english".to_string()),
         };
         let path = match bind_info.get_named_parameter_value("path").as_str() {
             Ok(s) if !s.trim().is_empty() => s.to_string(),
@@ -1231,7 +1245,10 @@ quack_rs::table_bind_callback!(psearch_bind, |info| {
                 ));
                 return;
             }
-            None => 10,
+            None => setting_str(&bind_info, "tantivy_default_top_k")
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .filter(|v| (1..=100_000).contains(v))
+                .unwrap_or(10),
         };
 
         // V3 field boosts: boosts := 'title:2.0, abstract:1.5' — applied to
@@ -2432,6 +2449,25 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
         }
     }
 
+    // P1b SQL knobs: SET tantivy_default_language = 'chinese' /
+    // SET tantivy_default_top_k = 50 — read at bind time as the fallback for
+    // the language / top_k named parameters (explicit args always win).
+    // Registered as SESSION-scope settings; RESET restores the defaults.
+    unsafe {
+        ConfigOptionBuilder::try_new("tantivy_default_language")?
+            .description("Default language for tantivy indexes when the language parameter is omitted")?
+            .option_type(TypeId::Varchar)
+            .default_value("english")?
+            .scope(ConfigOptionScope::Session)
+            .register(con.as_raw_connection())?;
+        ConfigOptionBuilder::try_new("tantivy_default_top_k")?
+            .description("Default top_k for tantivy_search_index when top_k is omitted")?
+            .option_type(TypeId::BigInt)
+            .default_value("10")?
+            .scope(ConfigOptionScope::Session)
+            .register(con.as_raw_connection())?;
+    }
+
     // bm25_search(table, query, id_column := '', text_column := 'body',
     //             language := 'english', top_k := 100)
     // table and query are the only required (positional) parameters; the rest
@@ -2609,4 +2645,4 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
     Ok(())
 }
 
-quack_rs::entry_point_v2!(tantivy_init_c_api, |con| register_all(con));
+quack_rs::entry_point_v2!(tantivy_init_c_api, quack_rs::abi::AbiPolicy::AllowUnknownEngine, |con| register_all(con));
