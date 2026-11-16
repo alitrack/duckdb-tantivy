@@ -984,3 +984,73 @@ fn persistent_index_100k_rows() {
     eprintln!("100k perf: build={build_ms}ms, 2 searches={search_ms}ms (n1={n1}, n2={n2})");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn persistent_upsert_and_remove_mutate_index() {
+    let d = db();
+    d.execute_batch(CORPUS).unwrap();
+    let dir = persist_dir("mutate");
+    d.execute_batch(&format!(
+        "SELECT * FROM tantivy_create_index('mut_ci','docs', id_column:='doc_id', text_column:='body', path:='{dir}')"
+    ))
+    .unwrap();
+
+    // Delta: doc 0's text changed, doc 99 is brand-new.
+    d.execute_batch(
+        "CREATE OR REPLACE TABLE delta_add(doc_id BIGINT, body VARCHAR);
+         INSERT INTO delta_add VALUES (0,'the cat was replaced by a hamster'),(99,'a hamster in a cage');",
+    )
+    .unwrap();
+    let summary: String = d
+        .query_one(&format!(
+            "SELECT name || '|' || docs::VARCHAR FROM tantivy_upsert_index('mut_ci','delta_add', id_column:='doc_id', text_column:='body')"
+        ))
+        .unwrap();
+    assert_eq!(summary, "mut_ci|6", "5 base + 1 new doc: {summary}");
+
+    // The new doc is immediately searchable through the replaced registry entry.
+    let n_hamster: i64 = d
+        .query_one("SELECT count(*) FROM tantivy_search_index('mut_ci','hamster', top_k:=10)")
+        .unwrap();
+    assert_eq!(n_hamster, 2, "both hamster docs visible after upsert: {n_hamster}");
+    // Doc 0's OLD text had 'warm'/'mat'; its NEW text ("the cat was replaced
+    // by a hamster") does not. So 'warm' must now return 0 hits — proving the
+    // old doc-0 version was actually deleted, not just shadowed.
+    let warm: i64 = d
+        .query_one("SELECT count(*) FROM tantivy_search_index('mut_ci','warm', top_k:=10)")
+        .unwrap();
+    assert_eq!(warm, 0, "doc 0 replaced → 'warm' (old text) unsearchable: {warm}");
+    // 'cat' is in doc 0's NEW text AND docs 1, 4 → 3 hits (not 2).
+    let cats: i64 = d
+        .query_one("SELECT count(*) FROM tantivy_search_index('mut_ci','cat', top_k:=10)")
+        .unwrap();
+    assert_eq!(cats, 3, "cat in doc0-new + doc1 + doc4: {cats}");
+
+    // Remove doc 1 → its unique word vanishes from the index.
+    d.execute_batch(
+        "CREATE OR REPLACE TABLE delta_del(doc_id BIGINT);
+         INSERT INTO delta_del VALUES (1);",
+    )
+    .unwrap();
+    let summary: String = d
+        .query_one(&format!(
+            "SELECT name || '|' || docs::VARCHAR FROM tantivy_remove_index('mut_ci','delta_del', id_column:='doc_id')"
+        ))
+        .unwrap();
+    assert_eq!(summary, "mut_ci|5", "one doc removed: {summary}");
+    let laser: i64 = d
+        .query_one("SELECT count(*) FROM tantivy_search_index('mut_ci','laser', top_k:=10)")
+        .unwrap();
+    assert_eq!(laser, 0, "doc 1 removed → 'laser' unsearchable: {laser}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn persistent_upsert_missing_name_is_error() {
+    let d = db();
+    let err = d
+        .query_one::<i64>("SELECT count(*) FROM tantivy_upsert_index('no_such_idx','docs')")
+        .expect_err("must fail on unknown index name");
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("no persistent index"), "clear missing-index error: {msg}");
+}

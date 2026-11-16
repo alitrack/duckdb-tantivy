@@ -1196,6 +1196,12 @@ fn mutate_bind_common(info: duckdb_bind_info, kind: MutateKind) -> Option<Mutate
                 }
             }
         }
+        bind_info
+            .add_result_column("name", TypeId::Varchar)
+            .add_result_column("path", TypeId::Varchar)
+            .add_result_column("docs", TypeId::BigInt)
+            .add_result_column("language", TypeId::Varchar)
+            .set_cardinality(1, true);
         Some(MutateBind {
             name,
             table: table.trim().to_string(),

@@ -40,7 +40,7 @@ use tantivy::directory::MmapDirectory;
 #[cfg(target_arch = "wasm32")]
 use tantivy::directory::RamDirectory;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED};
+use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, INDEXED, STORED};
 use tantivy::Term;
 use tantivy::tokenizer::{
     Language as TvLanguage, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
@@ -1062,10 +1062,14 @@ pub fn create_persistent_multifield(
     })?;
 
     // Same schema shape as `bm25_search`: a stored i64 id + an analyzed body,
-    // plus one analyzed text field per V3 extra field. Built unconditionally
-    // (both targets read id_field/body_field below).
+    // plus one analyzed text field per V3 extra field. The id also carries a
+    // term index (IndexOption::YES, STORED kept) so `delete_term` can locate a
+    // doc by id — required by tantivy_upsert_index / tantivy_remove_index.
     let mut sb = Schema::builder();
-    let id_field = sb.add_i64_field("id", STORED);
+    let id_field = sb.add_i64_field(
+        "id",
+        STORED | INDEXED,
+    );
     let text_opts = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer(ANALYZER)
