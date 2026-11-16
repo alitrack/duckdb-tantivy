@@ -109,6 +109,8 @@ results **bit-identical** to `bm25_search` over the same rows.
 | Function | Returns |
 |---|---|
 | `tantivy_create_index(name, table, [id_column := ''], [text_column := 'body'], [language := 'english'], [path := ''], [extra_fields := ''])` | `name, path, docs, language` |
+| `tantivy_upsert_index(name, delta_table, [id_column := ''], [text_column := 'body'], [extra_fields := ''])` | `name, path, docs, language` |
+| `tantivy_remove_index(name, ids_table, [id_column := ''])` | `name, path, docs, language` |
 | `tantivy_search_index(name, query, [top_k := 10], [boosts := ''])` with `boosts := 'title:2.0'` | per-query field boosts (V3) |
 | `tantivy_search_index(name, query, [top_k := 10])` | `doc_id BIGINT, score DOUBLE` |
 | `tantivy_stats(name, query)` | `num_docs, segments, query_terms, estimated_postings_bytes, total_index_bytes, estimated_max_candidates, confidence, notes` |
@@ -121,6 +123,25 @@ results **bit-identical** to `bm25_search` over the same rows.
   on-disk index `name` from the table's current rows and registers it in the
   process-global registry. Default location: `$TANTIVY_INDEX_DIR/<name>`,
   else `.tantivy_index/<name>` in the working directory.
+- `tantivy_upsert_index` and `tantivy_remove_index` are the incremental
+  write path — the "half-live" updates for an existing persistent index, so
+  you can reflect small table deltas **without a full rebuild** (rebuild cost
+  is O(corpus); these are O(delta)).
+  - `tantivy_upsert_index(name, delta_table, …)` reads rows from
+    `delta_table`; for each row the existing doc with that `id_column` value
+    is `delete_term`-ed first (tantivy upsert semantics — no shadowing, the
+    old text is genuinely removed), then the fresh `text_column` (plus any
+    `extra_fields`) is added. New ids are simply added.
+  - `tantivy_remove_index(name, ids_table, id_column)` deletes the docs whose
+    ids appear in `ids_table` (a table with one column).
+  - Both return the post-update summary (`name, path, docs, language`) and
+    the next `tantivy_search_index` sees the change immediately.
+  - The delta tables are DuckDB tables, not index names — the `name` arg is
+    the already-registered index to mutate.
+  - Native only: on wasm32 the index lives in a RAM directory with no fs to
+    reopen from, so these are not registered there (same treatment as
+    `tantivy_rrf_hybrid`).
+
 - `tantivy_search_index` runs a BM25 query against a registered index: the
   same query pipeline (NFC, metacharacter sanitization, conjunctive/AND
   matching, score-desc/doc-id-asc tie-break at the cutoff) as `bm25_search`,
