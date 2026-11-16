@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use libduckdb_sys::{duckdb_data_chunk_get_size, duckdb_vector_size};
+use libduckdb_sys::{
+    duckdb_bind_info, duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_function_info,
+    duckdb_init_info, duckdb_vector_size,
+};
 use quack_rs::connection::{Connection, Registrar};
 use quack_rs::config_option::{ConfigOptionBuilder, ConfigOptionScope};
 use quack_rs::data_chunk::DataChunk;
@@ -1063,6 +1066,404 @@ quack_rs::table_scan_callback!(create_scan, |info, output| {
         unsafe { chunk.set_size(1) };
     }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table functions: tantivy_upsert_index / tantivy_remove_index
+//
+// The "half-live" write path for persistent indexes: instead of rebuilding
+// the whole index from a table, apply a delta. Upsert = delete the ids in
+// `table` then re-add their fresh rows (tantivy tombstones the old docs; the
+// new segment wins at search time). Remove = delete the ids in `table` with
+// no re-add. Both commit, reopen read-only, and REPLACE the registry entry,
+// because searches run through a pinned searcher snapshot that only a fresh
+// open sees the new commit in. Deleting an absent id is a permissive no-op.
+//
+// Both share one bind/init/scan core; only the add/delete split differs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq)]
+enum MutateKind {
+    Upsert,
+    Remove,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct MutateBind {
+    name: String,
+    table: String,
+    id_column: String,
+    text_column: String,
+    extra_fields: Vec<String>,
+    kind: MutateKind,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct MutateState {
+    name: String,
+    path: String,
+    docs: i64,
+    language: String,
+    done: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mutate_init_error(init_info: &mut InitInfo, info: duckdb_init_info, msg: &str) {
+    unsafe {
+        init_info.set_error(msg);
+        FfiInitData::<MutateState>::set(
+            info,
+            MutateState {
+                name: String::new(),
+                path: String::new(),
+                docs: 0,
+                language: String::new(),
+                done: true,
+            },
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mutate_bind_common(info: duckdb_bind_info, kind: MutateKind) -> Option<MutateBind> {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info
+            .get_parameter_value(0)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let fcn = if kind == MutateKind::Upsert {
+            "tantivy_upsert_index"
+        } else {
+            "tantivy_remove_index"
+        };
+        if !search::is_safe_index_name(&name) {
+            bind_info.set_error(&format!(
+                "{fcn}: name must be a single identifier segment like 'my_index'"
+            ));
+            return None;
+        }
+        if !registry_lock().contains_key(&name) {
+            bind_info.set_error(&format!(
+                "{fcn}: no persistent index '{name}' is registered (tantivy_create_index or tantivy_load_index first)"
+            ));
+            return None;
+        }
+        let table = bind_info.get_parameter_value(1).as_str().unwrap_or_default();
+        if table.trim().is_empty() {
+            bind_info.set_error(&format!("{fcn}: the delta table is required (it supplies the ids)"));
+            return None;
+        }
+        let id_column = match bind_info.get_named_parameter_value("id_column").as_str() {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => "id".to_string(),
+        };
+        if !is_safe_identifier(&id_column) {
+            bind_info.set_error(&format!(
+                "{fcn}: id_column '{id_column}' must be an identifier like 'id'"
+            ));
+            return None;
+        }
+        let mut text_column = String::new();
+        let mut extra_fields: Vec<String> = Vec::new();
+        if kind == MutateKind::Upsert {
+            text_column = match bind_info.get_named_parameter_value("text_column").as_str() {
+                Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => "body".to_string(),
+            };
+            if !is_safe_identifier(&text_column) {
+                bind_info.set_error(&format!(
+                    "{fcn}: text_column '{text_column}' must be an identifier like 'body'"
+                ));
+                return None;
+            }
+            extra_fields = match bind_info.get_named_parameter_value("extra_fields").as_str() {
+                Ok(x) if !x.trim().is_empty() => x
+                    .split(',')
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for c in &extra_fields {
+                if !is_safe_identifier(c) {
+                    bind_info.set_error(&format!(
+                        "{fcn}: extra field '{c}' must be an identifier like 'title'"
+                    ));
+                    return None;
+                }
+            }
+        }
+        Some(MutateBind {
+            name,
+            table: table.trim().to_string(),
+            id_column,
+            text_column,
+            extra_fields,
+            kind,
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+quack_rs::table_bind_callback!(upsert_bind, |info| {
+    if let Some(b) = mutate_bind_common(info, MutateKind::Upsert) {
+        unsafe { FfiBindData::<MutateBind>::set(info, b) };
+    }
+});
+
+#[cfg(not(target_arch = "wasm32"))]
+quack_rs::table_bind_callback!(remove_bind, |info| {
+    if let Some(b) = mutate_bind_common(info, MutateKind::Remove) {
+        unsafe { FfiBindData::<MutateBind>::set(info, b) };
+    }
+});
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mutate_init(info: duckdb_init_info) {
+    unsafe {
+        let mut init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+
+        let Some(bind) = FfiBindData::<MutateBind>::get_from_init(info) else {
+            FfiInitData::<MutateState>::set(
+                info,
+                MutateState {
+                    name: String::new(),
+                    path: String::new(),
+                    docs: 0,
+                    language: String::new(),
+                    done: true,
+                },
+            );
+            return;
+        };
+        let fcn = if bind.kind == MutateKind::Upsert {
+            "tantivy_upsert_index"
+        } else {
+            "tantivy_remove_index"
+        };
+
+        let mut delete_ids: Vec<i64> = Vec::new();
+        let mut add: Vec<(i64, String, Vec<(String, String)>)> = Vec::new();
+        {
+            let sess = match session() {
+                Ok(s) => s,
+                Err(e) => {
+                    mutate_init_error(&mut init_info, info, e.message());
+                    return;
+                }
+            };
+            let extra_sel: String = bind
+                .extra_fields
+                .iter()
+                .map(|c| format!(", {}::VARCHAR", c))
+                .collect();
+            let sql = if bind.kind == MutateKind::Upsert {
+                format!(
+                    "SELECT {}::BIGINT AS id, {}::VARCHAR AS text{} FROM {}",
+                    bind.id_column,
+                    bind.text_column,
+                    extra_sel,
+                    bind.table
+                )
+            } else {
+                format!(
+                    "SELECT {}::BIGINT AS id, ''::VARCHAR AS text FROM {}",
+                    bind.id_column, bind.table
+                )
+            };
+            // Cheap pre-check: reject a delta bigger than the writer can
+            // hold before copying a single row (same guard as create).
+            let probe_sql = format!("SELECT count(*)::BIGINT FROM {}", bind.table);
+            let mut p = match sess.con.query(&probe_sql) {
+                Ok(r) => r,
+                Err(e) => {
+                    mutate_init_error(&mut init_info, info, &format!("{fcn}: {e}"));
+                    return;
+                }
+            };
+            let chunk = match p.next_chunk() {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    mutate_init_error(
+                        &mut init_info,
+                        info,
+                        &format!("{fcn}: pre-check returned no rows"),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    mutate_init_error(&mut init_info, info, &format!("{fcn}: {e}"));
+                    return;
+                }
+            };
+            let r = unsafe { chunk.reader(0) };
+            let row_count = unsafe { r.read_i64(0) } as u64;
+            if row_count > search::MAX_DOCS as u64 {
+                mutate_init_error(
+                    &mut init_info,
+                    info,
+                    &format!(
+                        "{fcn}: delta table '{table}' has {row_count} ids; the limit is {d} — narrow the delta",
+                        table = bind.table,
+                        d = search::MAX_DOCS
+                    ),
+                );
+                return;
+            }
+            drop(p);
+            let mut result = match sess.con.query(&sql) {
+                Ok(r) => r,
+                Err(e) => {
+                    mutate_init_error(&mut init_info, info, &format!("{fcn}: {e}"));
+                    return;
+                }
+            };
+            loop {
+                match result.next_chunk() {
+                    Ok(Some(chunk)) => {
+                        let d: &DataChunk = &chunk;
+                        let id_reader = unsafe { d.reader(0) };
+                        let text_reader = unsafe { d.reader(1) };
+                        for row in 0..d.size() {
+                            if !unsafe { id_reader.is_valid(row) } {
+                                continue; // NULL id → cannot address this row
+                            }
+                            let id = unsafe { id_reader.read_i64(row) };
+                            delete_ids.push(id);
+                            if bind.kind == MutateKind::Upsert {
+                                if !unsafe { text_reader.is_valid(row) } {
+                                    continue; // NULL text → nothing to add
+                                }
+                                let text = unsafe { text_reader.read_str(row) }.to_string();
+                                if text.len() > search::MAX_TEXT_BYTES {
+                                    mutate_init_error(
+                                        &mut init_info,
+                                        info,
+                                        &format!(
+                                            "{fcn}: a row in '{table}' exceeds the {b}-byte per-text limit",
+                                            table = bind.table,
+                                            b = search::MAX_TEXT_BYTES
+                                        ),
+                                    );
+                                    return;
+                                }
+                                let mut extras: Vec<(String, String)> = Vec::new();
+                                for (i, fname) in bind.extra_fields.iter().enumerate() {
+                                    let er = unsafe { d.reader(2 + i) };
+                                    if unsafe { er.is_valid(row) } {
+                                        extras.push((
+                                            fname.clone(),
+                                            unsafe { er.read_str(row) }.to_string(),
+                                        ));
+                                    }
+                                }
+                                add.push((id, text, extras));
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        mutate_init_error(&mut init_info, info, &format!("{fcn}: {e}"));
+                        return;
+                    }
+                }
+            }
+            // `result`, `p`, and `sess` (session lock + re-entry mark) drop
+            // here, before the lock-free write below.
+        }
+
+        // Serialize mutations per index: a concurrent upsert/remove on the
+        // same name must not interleave delete/add/commit in the directory.
+        let _build_guard = CREATE_INDEX_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let idx = {
+            let idx_arc = match registry_lock().get(&bind.name).cloned() {
+                Some(a) => a,
+                None => {
+                    mutate_init_error(
+                        &mut init_info,
+                        info,
+                        &format!(
+                            "{fcn}: index '{}' vanished before the mutation ran",
+                            bind.name
+                        ),
+                    );
+                    return;
+                }
+            };
+            match search::update_persistent_multifield(&idx_arc, &add, &delete_ids) {
+                Ok(i) => i,
+                Err(e) => {
+                    mutate_init_error(&mut init_info, info, &format!("{fcn}: {e}"));
+                    return;
+                }
+            }
+        };
+        drop(_build_guard);
+        // Snapshot the fields we need before the Arc move below.
+        let out_name = idx.name.clone();
+        let out_path = idx.path.clone();
+        let out_docs = idx.num_docs as i64;
+        let out_lang = idx.language.clone();
+        // REPLACE the registry entry: the pinned searcher snapshot in the old
+        // object predates this commit, so a search through it would still see
+        // the pre-mutation index.
+        registry_lock().insert(out_name.clone(), std::sync::Arc::new(idx));
+
+        FfiInitData::<MutateState>::set(
+            info,
+            MutateState {
+                name: out_name,
+                path: out_path,
+                docs: out_docs,
+                language: out_lang,
+                done: false,
+            },
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+quack_rs::table_init_callback!(upsert_init, |info| { mutate_init(info) });
+
+#[cfg(not(target_arch = "wasm32"))]
+quack_rs::table_init_callback!(remove_init, |info| { mutate_init(info) });
+
+#[cfg(not(target_arch = "wasm32"))]
+fn mutate_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<MutateState>::get_mut(info) else {
+            unsafe { chunk.set_size(0) };
+            return;
+        };
+        if state.done {
+            unsafe { chunk.set_size(0) };
+            return;
+        }
+        let mut name_writer = unsafe { chunk.writer(0) };
+        let mut path_writer = unsafe { chunk.writer(1) };
+        let mut docs_writer = unsafe { chunk.writer(2) };
+        let mut lang_writer = unsafe { chunk.writer(3) };
+        unsafe {
+            name_writer.write_varchar(0, &state.name);
+            path_writer.write_varchar(0, &state.path);
+            docs_writer.write_i64(0, state.docs);
+            lang_writer.write_varchar(0, &state.language);
+        }
+        state.done = true;
+        unsafe { chunk.set_size(1) };
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+quack_rs::table_scan_callback!(upsert_scan, |info, output| { mutate_scan(info, output) });
+
+#[cfg(not(target_arch = "wasm32"))]
+quack_rs::table_scan_callback!(remove_scan, |info, output| { mutate_scan(info, output) });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2735,6 +3136,39 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .init(create_init)
             .scan(create_scan),
     )?;
+
+    // tantivy_upsert_index(name, table, [id_column := 'id'], [text_column := 'body'],
+    //                      [extra_fields := ''])
+    //   → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+    // tantivy_remove_index(name, table, [id_column := 'id'])
+    //   → name VARCHAR, path VARCHAR, docs BIGINT, language VARCHAR
+    // Incremental ("half-live") writes: apply a delta to an existing persistent
+    // index instead of rebuilding it from a table. Both return the post-mutation
+    // doc count so the caller can confirm the commit. Native only — wasm
+    // indexes live in a RAM directory and cannot be reopened after a commit.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        con.register_table(
+            TableFunctionBuilder::new("tantivy_upsert_index")
+                .param(TypeId::Varchar)
+                .param(TypeId::Varchar)
+                .named_param("id_column", TypeId::Varchar)
+                .named_param("text_column", TypeId::Varchar)
+                .named_param("extra_fields", TypeId::Varchar)
+                .bind(upsert_bind)
+                .init(upsert_init)
+                .scan(upsert_scan),
+        )?;
+        con.register_table(
+            TableFunctionBuilder::new("tantivy_remove_index")
+                .param(TypeId::Varchar)
+                .param(TypeId::Varchar)
+                .named_param("id_column", TypeId::Varchar)
+                .bind(remove_bind)
+                .init(remove_init)
+                .scan(remove_scan),
+        )?;
+    }
 
     // tantivy_search_index(name, query, [top_k := 10])
     //   → doc_id BIGINT, score DOUBLE  (same tie-break as bm25_search)

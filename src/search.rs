@@ -1430,6 +1430,136 @@ pub fn persistent_search_boosted(
     Ok(hits)
 }
 
+/// Apply incremental mutations to an existing persistent index and return a
+/// fresh `PersistentIndex` over the new committed snapshot.
+///
+/// This is the "half-live" write path: an index built by
+/// [`create_persistent_multifield`] can be mutated in place instead of
+/// rebuilt from a table — upsert a document (tantivy's `delete_term(id)` +
+/// `add_document` is the canonical upsert: the old segment's doc is
+/// tombstoned, the new one is committed as a fresh doc), delete by id, and
+/// optionally merge the resulting segments. Deletions are permissive
+/// (tantivy ignores terms that match nothing), so a no-op upsert/delete is a
+/// commit with zero delta.
+///
+/// The returned index is a NEW object: searches go through a pinned
+/// `searcher_handle` snapshot, so the caller (the registry) must REPLACE its
+/// entry with the result, not mutate the old one. The on-disk directory is
+/// unchanged in location — `path` is identical — so `save`/`load` and the
+/// provenance sidecar stay valid without rewrites.
+///
+/// `add_extras` maps an added document's id to its (field_name, value) pairs;
+/// a field the index has that the map lacks is simply absent for that doc,
+/// exactly like the create path. `do_merge` triggers a background merge of
+/// small segments (tantivy merges opportunistically on commit regardless;
+/// the explicit ask bounds post-upsert segment growth).
+///
+/// Native only: wasm indexes live in a RAM directory with no fs to reopen
+/// from, so the SQL layer gates the mutate functions out entirely on
+/// wasm32 (same treatment as `tantivy_rrf_hybrid`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn update_persistent_multifield(
+    idx: &PersistentIndex,
+    add: &[(i64, String, Vec<(String, String)>)],
+    delete_ids: &[i64],
+) -> Result<PersistentIndex> {
+    if add.is_empty() && delete_ids.is_empty() {
+        // Pure no-op: nothing was written, the committed snapshot is still
+        // valid. Reopen is skipped (it would just re-read the same
+        // segments); the caller keeps its entry untouched.
+        return Ok(idx.clone_searcher());
+    }
+
+    let dir = PathBuf::from(&idx.path);
+    let index = Index::open_in_dir(&dir).map_err(|e| {
+        SearchError::Internal(format!(
+            "cannot open index in '{}': {e}",
+            dir.display()
+        ))
+    })?;
+    // Reopened index carries an empty tokenizer manager (managers are
+    // per-process) — re-register, mirroring `open_persistent`.
+    let l = resolve_language(&idx.language)?;
+    index.tokenizers().register(ANALYZER, analyzer_for(&l));
+
+    let schema = index.schema();
+    let id_field = schema
+        .get_field("id")
+        .map_err(|e| SearchError::Internal(format!("index schema missing 'id' field: {e}")))?;
+    let body_field = schema.get_field("body").map_err(|e| {
+        SearchError::Internal(format!("index schema missing 'body' field: {e}"))
+    })?;
+
+    let mut writer = index
+        .writer(WRITER_HEAP_BYTES)
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+
+    // 1) Deletes: one term-deletion per id (tantivy's standard upsert-remove
+    // half). Nonexistent ids are a no-op, so callers don't have to
+    // pre-filter.
+    for id in delete_ids {
+        writer.delete_term(Term::from_field_i64(id_field, *id));
+    }
+
+    // 2) Upserts: delete the existing doc with this id (no-op if absent),
+    // then add the fresh one. The delete is applied to the writer's own
+    // segment view; the add lands in a new segment, which takes precedence
+    // at search time, so no commit interleaving is needed.
+    for (id, text, extras) in add {
+        writer.delete_term(Term::from_field_i64(id_field, *id));
+        let text = nfc(text);
+        let mut bd = doc!(id_field => *id, body_field => text.as_str());
+        for (fname, f) in &idx.extra_fields {
+            if let Some((_, v)) = extras.iter().find(|(k, _)| k == fname) {
+                let vv = nfc(v);
+                bd.add_field_value(*f, vv.as_str());
+            }
+        }
+        writer
+            .add_document(bd)
+            .map_err(|e| SearchError::Internal(e.to_string()))?;
+    }
+
+    // tantivy merges small segments opportunistically on commit; the
+    // subsequent reopen surfaces the consolidated view (no explicit merge).
+    writer
+        .commit()
+        .map_err(|e| SearchError::Internal(e.to_string()))?;
+    drop(writer); // release the directory lockfile before reopening
+
+    // Reopen read-only for the fresh searcher snapshot; the provenance
+    // sidecar is untouched (same name/language/extra_fields on disk).
+    let idx2 = open_persistent(&idx.name, &dir)?;
+    Ok(idx2)
+}
+
+/// A cheap re-pin of the current searcher snapshot. Used by
+/// [`update_persistent_multifield`] for the pure no-op case: the committed
+/// segments didn't change, so we just hand back an equivalent
+/// `PersistentIndex` (a fresh `Searcher` over the same reader) rather than
+/// force the caller to clone the whole struct.
+#[cfg(not(target_arch = "wasm32"))]
+impl PersistentIndex {
+    pub fn clone_searcher(&self) -> Self {
+        // The reader is shared; a fresh searcher re-pins the latest commit
+        // visible to this reader, which for an immutable index is the same
+        // snapshot the struct already carries.
+        let searcher = self.reader.searcher();
+        let docs = searcher.num_docs() as usize;
+        PersistentIndex {
+            name: self.name.clone(),
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            searcher_handle: searcher,
+            id_field: self.id_field,
+            body_field: self.body_field,
+            extra_fields: self.extra_fields.clone(),
+            language: self.language.clone(),
+            num_docs: docs,
+        }
+    }
+}
+
 /// Generate a highlighted snippet of `text` for `query`, using the corpus
 /// statistics (term doc-frequencies + the index's own tokenizer/stemmer) of
 /// the registered persistent index `idx`. The index supplies IDF-weighted
