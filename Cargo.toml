@@ -35,9 +35,6 @@ crate-type = ["staticlib"]
 tantivy = { version = "=0.24.2", default-features = false }
 
 serde_json = "1"
-# turbovec — same crate duckdb_turbovec uses; lets us load its on-disk
-# IdMapIndex (.tv files) directly for the vector half of RRF hybrid search
-turbovec = "1.1"
 # jieba-rs — Chinese word segmentation (MIT). Pinned to the 0.7 line per the
 # feature design: 0.7.x's `cut()` API is stable, embeds the dictionary (no
 # file IO), and is Send+Sync (wrappable in Arc for tantivy's shared
@@ -69,6 +66,11 @@ libduckdb-sys = { version = "1.10504", features = ["loadable-extension"] }
 # ephemeral search path already uses; MmapDirectory sites below are cfg'd.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tantivy = { version = "=0.24.2", default-features = false, features = ["mmap", "stopwords", "lz4-compression"] }
+# turbovec — same crate duckdb_turbovec uses; lets us load its on-disk
+# IdMapIndex (.tv files) directly for the vector half of RRF hybrid search.
+# 64-bit targets only: turbovec has `compile_error!` for 32-bit, so it must
+# stay out of the wasm32 build (the RRF hybrid surface is cfg-gated to match).
+turbovec = "1.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tantivy = { version = "=0.24.2", default-features = false, features = ["stopwords", "lz4-compression"] }

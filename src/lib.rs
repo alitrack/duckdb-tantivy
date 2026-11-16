@@ -1220,7 +1220,11 @@ quack_rs::table_scan_callback!(stats_scan, |info, output| {
 // tantivy index (id_column) and the turbovec index (external ids).
 // The vector half loads turbovec's own on-disk IdMapIndex (.tv) via the
 // same crates.io turbovec crate duckdb_turbovec uses — no format glue.
+// wasm32: turbovec is 64-bit-only (compile_error! on 32-bit), so the whole
+// RRF surface (dependency + the items below + the registration) is cfg'd out
+// there; core BM25 FTS is unaffected.
 
+#[cfg(not(target_arch = "wasm32"))]
 struct RrfBind {
     fts_name: String,
     fts_query: String,
@@ -1231,11 +1235,13 @@ struct RrfBind {
     vec_fetch: i64,    // how deep to search the vector index
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct RrfState {
     rows: Vec<(i64, f64, i64, i64, f64, f64)>, // id, rrf, fts_rank, vec_rank, fts_score, vec_score
     next: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_f32_json(s: &str) -> Result<Vec<f32>, String> {
     let v: Vec<f64> = serde_json::from_str(s).map_err(|e| format!("bad vector JSON: {e}"))?;
     if v.is_empty() {
@@ -1247,6 +1253,7 @@ fn parse_f32_json(s: &str) -> Result<Vec<f32>, String> {
     Ok(v.into_iter().map(|x| x as f32).collect())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 quack_rs::table_bind_callback!(rrf_bind, |info| {
     unsafe {
         let bind_info = BindInfo::new(info);
@@ -1304,6 +1311,7 @@ quack_rs::table_bind_callback!(rrf_bind, |info| {
     }
 });
 
+#[cfg(not(target_arch = "wasm32"))]
 quack_rs::table_init_callback!(rrf_init, |info| {
     unsafe {
         let init_info = InitInfo::new(info);
@@ -1398,10 +1406,12 @@ quack_rs::table_init_callback!(rrf_init, |info| {
 
 /// IdMapIndex::search returns (scores, ids) row-major for ONE query as a flat
 /// slice of len = clamped k; helper to get the effective row count.
+#[cfg(not(target_arch = "wasm32"))]
 fn idx_search_rows(ids: &[u64], fetch: usize) -> usize {
     ids.len().min(fetch)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 quack_rs::table_scan_callback!(rrf_scan, |info, output| {
     unsafe {
         let chunk = DataChunk::from_raw(output);
@@ -2746,6 +2756,8 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
     //   → doc_id, rrf_score, fts_rank, vec_rank, fts_score, vec_score
     // Reciprocal Rank Fusion of tantivy BM25 + turbovec IVF vector search.
     // vec_dir = the turboquant_build_ivf output dir (reads its index.tv).
+    // Not registered on wasm32 (turbovec is 64-bit-only).
+    #[cfg(not(target_arch = "wasm32"))]
     con.register_table(
         TableFunctionBuilder::new("tantivy_rrf_hybrid")
             .param(TypeId::Varchar)
