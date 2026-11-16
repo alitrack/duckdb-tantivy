@@ -1148,6 +1148,7 @@ pub fn create_persistent_multifield(
             searcher_handle: searcher,
             id_field,
             body_field,
+            extra_fields: extra_field_handles,
             language: lang_id(&l).to_string(),
             num_docs,
         });
