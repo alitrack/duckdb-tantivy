@@ -536,7 +536,7 @@ pub fn bm25_search(docs: &[Document], query: &str, lang: &str, limit: usize) -> 
     let mut parser = QueryParser::for_index(&index, vec![body_field]);
     parser.set_conjunction_by_default(); // AND semantics: all terms must match.
     let parsed = parser
-        .parse_query(&sanitize_query(&nfc(query)))
+        .parse_query(&prepare_query(query, &l))
         .map_err(|e| SearchError::BadQuery(e.to_string()))?;
 
     // Collect enough to keep the full match set (see the fn doc for why a
@@ -613,6 +613,66 @@ pub fn sanitize_query(q: &str) -> String {
         }
     }
     out
+}
+
+/// Is `c` a CJK ideograph (the scripts a whitespace-free "word" can hide in)?
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3400}'..='\u{4DBF}'   // CJK Unified Ideographs Extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{3040}'..='\u{30FF}' // Hiragana / Katakana
+        | '\u{AC00}'..='\u{D7AF}' // Hangul syllables
+    )
+}
+
+/// Pre-segment a Chinese query so a whitespace-free sentence is not parsed as a
+/// phrase.
+///
+/// tantivy's `QueryParser` splits a query into words on whitespace, then runs
+/// each word through the field's tokenizer. A Chinese question has no spaces, so
+/// the whole question is ONE word; jieba then splits it into several tokens at
+/// *consecutive positions*, which the parser turns into a **phrase** query
+/// requiring those tokens to be adjacent in the document. `供应商付款条件` thus
+/// fails to match `供应商 ... 付款条件` — verified behaviour, not a theory.
+///
+/// The fix is the one every CJK search front-end applies: segment the CJK run
+/// with the same jieba chain the index uses, and OR the pieces inside one
+/// parenthesis group, so the group as a whole still ANDs with the rest of the
+/// query. Whitespace-separated words keep their existing AND semantics, and
+/// Latin words are passed through untouched.
+///
+/// Input is expected to be already sanitized (see [`sanitize_query`]): the `(`
+/// and `)` inserted here are deliberate query syntax and must not be escaped.
+pub fn segment_chinese_query(q: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for word in q.split_whitespace() {
+        if !word.chars().any(is_cjk) {
+            out.push(word.to_string());
+            continue;
+        }
+        let pieces = run_analyzer(chinese_analyzer(), word);
+        let pieces: Vec<String> = pieces
+            .into_iter()
+            .filter(|p| !p.trim().is_empty())
+            .collect();
+        if pieces.len() <= 1 {
+            out.push(word.to_string());
+        } else {
+            out.push(format!("({})", pieces.join(" OR ")));
+        }
+    }
+    out.join(" ")
+}
+
+/// Analyze a caller query for the resolved language: sanitize, then (for
+/// Chinese only) pre-segment CJK runs so they are not read as phrases.
+fn prepare_query(query: &str, lang: &Lang) -> String {
+    let sanitized = sanitize_query(&nfc(query));
+    match lang {
+        Lang::Chinese => segment_chinese_query(&sanitized),
+        Lang::Snowball(_) => sanitized,
+    }
 }
 
 /// The tantivy version string, e.g. `"tantivy v0.24.2, index_format v7"`.
@@ -1399,7 +1459,7 @@ pub fn persistent_search_boosted(
         }
     }
     let parsed = parser
-        .parse_query(&sanitize_query(&nfc(query)))
+        .parse_query(&prepare_query(query, &resolve_language(&idx.language)?))
         .map_err(|e| SearchError::BadQuery(e.to_string()))?;
 
     // Keep the FULL match set before the cutoff (same contract as bm25_search:
@@ -1590,7 +1650,7 @@ pub fn snippet(idx: &PersistentIndex, query: &str, text: &str) -> Result<String>
         return Ok(String::new());
     } else {
         parser
-            .parse_query(&sanitize_query(&nfc(query)))
+            .parse_query(&prepare_query(query, &resolve_language(&idx.language)?))
             .map_err(|e| SearchError::BadQuery(e.to_string()))?
     };
 
@@ -1896,6 +1956,52 @@ mod tests {
         assert!(conj.is_empty(), "AND semantics must yield no hits");
         // Absent word → no hits.
         assert!(bm25_search(&docs, "企鹅", "chinese", 10).unwrap().is_empty());
+    }
+
+    /// Regression (2026-11-20): a whitespace-free Chinese sentence used to be
+    /// ONE word for `QueryParser`, which then expanded its jieba tokens into a
+    /// **phrase** query — `供应商付款条件` matched only documents where those
+    /// two tokens were adjacent. BKN concept retrieval hit this as 0 recall.
+    #[test]
+    fn chinese_query_without_spaces_is_not_a_phrase() {
+        let docs = vec![Document::new(
+            0,
+            "供应商 供应商编码 付款条件 采购员 统一社会信用代码".into(),
+        )];
+        // Non-adjacent tokens: must match now (was empty before the fix).
+        let hits = bm25_search(&docs, "供应商付款条件", "chinese", 10).unwrap();
+        assert_eq!(hits.len(), 1, "whitespace-free query must not be a phrase");
+        // Adjacent tokens still match (this worked before, keep it working).
+        let adj = bm25_search(&docs, "统一社会信用代码", "chinese", 10).unwrap();
+        assert_eq!(adj.len(), 1);
+        // A word that is genuinely absent still yields nothing.
+        assert!(bm25_search(&docs, "库存盘点", "chinese", 10).unwrap().is_empty());
+        // Existing AND semantics for space-separated words are untouched.
+        assert!(bm25_search(&docs, "供应商 库存", "chinese", 10).unwrap().is_empty());
+        assert_eq!(bm25_search(&docs, "供应商 付款条件", "chinese", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn segment_chinese_query_ors_cjk_runs_only() {
+        assert_eq!(
+            segment_chinese_query("供应商付款条件"),
+            "(供应商 OR 付款条件)"
+        );
+        // Latin words are passed through, CJK runs are grouped.
+        assert_eq!(
+            segment_chinese_query("kafka 消费者组"),
+            "kafka (消费者 OR 组)"
+        );
+        // A single jieba piece stays bare — no pointless group.
+        assert_eq!(segment_chinese_query("库存"), "库存");
+        // Already-escaped metacharacters survive untouched.
+        assert_eq!(segment_chinese_query("e\\-mail 库存"), "e\\-mail 库存");
+    }
+
+    #[test]
+    fn bm25_score_chinese_uses_the_same_analysis() {
+        let hit = bm25_score("供应商 供应商编码 付款条件", "供应商付款条件", "chinese").unwrap();
+        assert!(hit > 0.0, "bm25_score must see the segmented query; got {hit}");
     }
 
     #[test]

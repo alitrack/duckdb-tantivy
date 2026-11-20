@@ -90,6 +90,45 @@ analyzer), so for CJK it surfaces whole contiguous Han runs as surface terms —
 use `bm25_search`/`tokenize` with `language := 'chinese'` when you need
 word-level Chinese terms.
 
+### Query semantics: a whitespace-free Chinese question is segmented, not phrased (v0.4.1)
+
+tantivy's `QueryParser` splits a query on **whitespace**, then runs each word
+through the field's tokenizer. A Chinese question has no spaces, so the whole
+question is one word; jieba then splits it into several tokens at *consecutive
+positions*, which the parser turns into a **phrase** query requiring adjacency.
+Before v0.4.1 that meant:
+
+```sql
+-- doc: '供应商 供应商编码 付款条件 采购员 统一社会信用代码'
+SELECT * FROM bm25_search('cards', '供应商付款条件', language := 'chinese');  -- 0 rows (phrase)
+SELECT * FROM bm25_search('cards', '供应商 付款条件', language := 'chinese'); -- 1 row  (AND of terms)
+```
+
+Every caller had to pre-segment with `tokenize(q,'chinese')` and join with
+` OR ` to get recall at all. Since v0.4.1 the extension does that itself: a
+whitespace-free CJK run is segmented with the same jieba chain the index uses
+and the pieces are OR-joined **inside one parenthesis group**, so the group as
+a whole still ANDs with the rest of the query:
+
+```sql
+SELECT * FROM bm25_search('cards', '供应商付款条件', language := 'chinese');
+-- 1 row: the run expands to (供应商 OR 付款条件)
+SELECT * FROM bm25_search('cards', '供应商 库存', language := 'chinese');
+-- 0 rows: two whitespace-separated words keep AND semantics (no doc has both)
+```
+
+Same analysis applies to `tantivy_search_index`, `tantivy_snippet` and
+`bm25_score`. Two consequences worth knowing:
+
+- **Recall-oriented trade-off.** `(a OR b)` also matches a card that carries
+  only one of the fragments (`统一社会信用代码` → `统一|社会|信用|代码` matches a
+  card holding `信用额度`). That is the same trade-off that made OR-joined
+  queries score best in the BKN concept-retrieval spike (MRR 0.852 vs 0.820 for
+  substring LIKE), just now without a caller-side workaround.
+- **Escape hatch.** If you want the old phrase behaviour, pass the query with an
+  explicit quoted phrase or pre-segment yourself and keep the terms
+  space-separated (AND).
+
 To rebuild and re-verify the whole chain from scratch (offline, rebuild + stamp + full test suite + Chinese assertions, exit 0 = all green):
 
 ```sh
